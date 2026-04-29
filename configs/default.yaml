@@ -1,0 +1,36 @@
+# delivery-vlm：读图前可选本地预处理
+preprocess:
+  max_long_edge: 1500
+  tone_mode: raw
+  auto_exif: true
+  auto_rotate: true
+  rotate_degrees: 0
+  deskew:
+    enabled: true
+    max_abs_degrees: 20
+    min_abs_degrees: 0.35
+
+page_text:
+  subdir: pages
+  manifest: pages.jsonl
+
+vlm:
+  model: qwen3.5-flash
+  max_workers: 8
+  max_long_edge: 1500
+  use_preprocess: true
+  temperature: 0.1
+  timeout_seconds: 300.0
+
+# 导出 xlsx 列：追溯列 + 下列字段（须与 prompts / delivery_schema 默认一致）
+delivery:
+  header_keys: []
+  line_keys:
+    - 款号
+    - 颜色
+    - S
+    - M
+    - L
+    - XL
+    - XXL
+    - 小计

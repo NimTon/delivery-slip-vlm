@@ -19,9 +19,12 @@ dependencies = [
 
 [project.scripts]
 delivery-vlm = "delivery_vlm.cli:main"
+delivery-vlm-gui = "delivery_vlm.gui_app:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=7.4.0"]
+gui = ["sv-ttk>=2.6.0"]
+ocr = ["paddleocr>=2.8.1"]
 
 [tool.pytest.ini_options]
 testpaths = ["test"]

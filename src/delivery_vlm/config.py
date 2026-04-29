@@ -42,3 +42,14 @@ def load_config(config_path: Path | None = None) -> dict[str, Any]:
     with path.open(encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
     return data
+
+
+def deep_merge_config(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
+    """递归合并配置：``overrides`` 中与 ``base`` 同名的 dict 会递归合并，否则覆盖。"""
+    out: dict[str, Any] = dict(base)
+    for k, v in overrides.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = deep_merge_config(out[k], v)  # type: ignore[arg-type]
+        else:
+            out[k] = v
+    return out

@@ -54,6 +54,9 @@ def _is_retryable_exc(e: BaseException) -> bool:
             "service unavailable",
             "bad gateway",
             "gateway",
+            "empty response",
+            "empty body",
+            "no content",
         )
     )
 

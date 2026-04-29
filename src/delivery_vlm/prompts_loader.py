@@ -42,3 +42,14 @@ def delivery_vlm_user(*, header_keys: list[str], line_keys: list[str]) -> str:
     hk = "、".join(header_keys) if header_keys else "（无：请勿输出 header，仅用 lines 或 items）"
     lk = "、".join(line_keys)
     return body.replace("__HEADER_KEYS__", hk).replace("__LINE_KEYS__", lk)
+
+
+def delivery_vlm_gate_system() -> str:
+    return get_prompt("vlm_delivery_gate_system.txt", _fb.VLM_GATE_SYSTEM)
+
+
+def delivery_vlm_gate_user(*, header_keys: list[str], line_keys: list[str]) -> str:
+    body = get_prompt("vlm_delivery_gate_user.txt", _fb.VLM_GATE_USER)
+    hk = "、".join(header_keys) if header_keys else "（无：请勿输出 header）"
+    lk = "、".join(line_keys)
+    return body.replace("__HEADER_KEYS__", hk).replace("__LINE_KEYS__", lk)

@@ -1,19 +1,28 @@
-# delivery-vlm：读图前可选本地预处理
 preprocess:
   max_long_edge: 1500
-  tone_mode: raw
+  tone_mode: shaded
   auto_exif: true
-  auto_rotate: true
-  rotate_degrees: 0
+  auto_rotate_ocr:
+    enabled: false
+    langs: ch
+    max_long_edge: 1500
   deskew:
     enabled: true
     max_abs_degrees: 20
     min_abs_degrees: 0.35
-
+  perspective:
+    enabled: true
+    min_area_ratio: 0.08
+    approx_epsilon_ratios:
+    - 0.02
+    - 0.03
+    - 0.045
+    - 0.06
+    max_detect_long_edge: 1500
+    rect_area_expand_ratio: 0.2
 page_text:
   subdir: pages
   manifest: pages.jsonl
-
 vlm:
   model: qwen3.5-flash
   max_workers: 8
@@ -21,16 +30,18 @@ vlm:
   use_preprocess: true
   temperature: 0.1
   timeout_seconds: 300.0
-
-# 导出 xlsx 列：追溯列 + 下列字段（须与 prompts / delivery_schema 默认一致）
+  use_vlm_rotation_gate: false
+  max_orientation_gate_rotations: 3
 delivery:
+  merge_by_style: false
+  merge_key: 款号
   header_keys: []
   line_keys:
-    - 款号
-    - 颜色
-    - S
-    - M
-    - L
-    - XL
-    - XXL
-    - 小计
+  - 款号
+  - 颜色
+  - S
+  - M
+  - L
+  - XL
+  - XXL
+  - 小计

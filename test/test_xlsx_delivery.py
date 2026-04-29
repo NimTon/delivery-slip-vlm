@@ -27,3 +27,14 @@ def test_write_delivery_xlsx(tmp_path: Path) -> None:
         columns=cols,
     )
     assert p.is_file()
+
+
+def test_write_user_mode_columns(tmp_path: Path) -> None:
+    cols = ("款号", "颜色", "S", "M", "L", "XL", "XXL", "小计")
+    p = tmp_path / "u.xlsx"
+    write_delivery_rows_to_xlsx(
+        p,
+        [{"款号": "Y", "颜色": "蓝", "S": "1", "M": "", "L": "", "XL": "", "XXL": "", "小计": "1"}],
+        columns=cols,
+    )
+    assert p.is_file()

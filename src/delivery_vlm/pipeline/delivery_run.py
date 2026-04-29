@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-import tempfile
+import shutil
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -11,18 +11,31 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from delivery_vlm.config import load_config, project_root, vlm_settings
+import cv2
+import numpy as np
+
+from delivery_vlm.config import deep_merge_config, load_config, project_root, vlm_settings
 from delivery_vlm.delivery_schema import (
     attach_trace,
     delivery_columns_from_config,
+    delivery_xlsx_options,
+    merge_line_rows_by_style,
     parse_delivery_response,
-    xlsx_column_order,
+    parse_vlm_orientation_gate_response,
+    vlm_use_rotation_gate_from_config,
+    xlsx_column_headers,
 )
 from delivery_vlm.io.xlsx_delivery import write_delivery_rows_to_xlsx
 from delivery_vlm.llm.client import OpenAICompatClient
 from delivery_vlm.llm.retry import call_with_retries_timeout
+from delivery_vlm.preprocess.geometry import load_bgr, rotate_90_bgr
 from delivery_vlm.preprocess.image import preprocess_image
-from delivery_vlm.prompts_loader import delivery_vlm_system, delivery_vlm_user
+from delivery_vlm.prompts_loader import (
+    delivery_vlm_gate_system,
+    delivery_vlm_gate_user,
+    delivery_vlm_system,
+    delivery_vlm_user,
+)
 from delivery_vlm.pipeline.scan_pages import list_input_images, page_id_for
 
 _log = logging.getLogger(__name__)
@@ -57,6 +70,15 @@ def _cap_workers(n_tasks: int, raw: Any) -> int:
     return min(w, max(1, n_tasks))
 
 
+def _prepare_run_temp_dir() -> Path:
+    """保留本次临时图到下次运行；下次开始前清空。"""
+    tdir = (project_root() / "data" / "tmp").resolve()
+    if tdir.exists():
+        shutil.rmtree(tdir, ignore_errors=True)
+    tdir.mkdir(parents=True, exist_ok=True)
+    return tdir
+
+
 def _wait_unpaused(
     *, pause: Callable[[], bool] | None, cancel: threading.Event | None
 ) -> bool:
@@ -89,14 +111,16 @@ def run_delivery_vlm_to_xlsx(
     cancel_event: threading.Event | None = None,
     paused: Callable[[], bool] | None = None,
     on_page_done: Callable[[int, int], None] | None = None,
+    config_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     cfg = load_config(config_path)
+    if config_overrides:
+        cfg = deep_merge_config(cfg, config_overrides)
     vs = vlm_settings()
     if not vs.get("api_key"):
         raise ValueError("未配置 VLM_API_KEY：请在 .env 中设置 VLM_BASE_URL 与 VLM_API_KEY")
 
     header_keys, line_keys = delivery_columns_from_config(cfg)
-    columns = list(xlsx_column_order(header_keys, line_keys))
 
     vlm = dict(cfg.get("vlm") or {})
     pre_cfg = dict(cfg.get("preprocess") or {})
@@ -119,6 +143,8 @@ def run_delivery_vlm_to_xlsx(
     out.mkdir(parents=True, exist_ok=True)
 
     max_long_edge = _resolve_max_long_edge(vlm=vlm, pre_cfg=pre_cfg)
+    gate_on = vlm_use_rotation_gate_from_config(vlm)
+    max_gate_rot = max(0, int(vlm.get("max_orientation_gate_rotations", 3) or 0))
 
     images = list_input_images(input_dir)
     if not images:
@@ -127,12 +153,19 @@ def run_delivery_vlm_to_xlsx(
 
     p_sys = delivery_vlm_system()
     p_user_template = delivery_vlm_user(header_keys=header_keys, line_keys=line_keys)
+    p_gate_sys = delivery_vlm_gate_system()
+    p_gate_user = delivery_vlm_gate_user(header_keys=header_keys, line_keys=line_keys)
+    if gate_on:
+        _log.info("VLM 朝向门控已开启（多轮识别；本地不做整页 90° 自动转正）")
+    else:
+        _log.info("VLM 朝向门控已关闭（单次识别；模型勿输出朝向 JSON；本地不做整页 90° 自动转正）")
     api_key = str(vs.get("api_key"))
     base_url = vs.get("base_url") or None
     n_img = len(images)
     max_workers = _cap_workers(n_img, vlm.get("max_workers"))
 
     manifest_rows: list[dict[str, Any]] = []
+    failed_pages: list[dict[str, Any]] = []
     cancelled = False
     man_path = (out / subdir / manifest_name).resolve()
     man_path.parent.mkdir(parents=True, exist_ok=True)
@@ -170,6 +203,7 @@ def run_delivery_vlm_to_xlsx(
         raw_response: str,
         biz_rows: list[dict[str, str]],
         parse_meta: dict[str, Any] | None,
+        page_extras: dict[str, Any] | None = None,
     ) -> tuple[Path, dict[str, Any]]:
         base = out / subdir
         base.mkdir(parents=True, exist_ok=True)
@@ -189,10 +223,12 @@ def run_delivery_vlm_to_xlsx(
             "parse_meta": parse_meta,
             "vlm_raw_preview": (raw_response or "")[:80000],
         }
+        if page_extras:
+            body.update(page_extras)
         json_path = (base / f"{page_id}.json").resolve()
         json_path.write_text(json.dumps(body, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         rel_j = json_path.relative_to(out.resolve())
-        man_row = {
+        man_row: dict[str, Any] = {
             "page_id": page_id,
             "source_image": str(source_image.resolve()),
             "structured_file": str(rel_j).replace("\\", "/"),
@@ -200,56 +236,81 @@ def run_delivery_vlm_to_xlsx(
             "segment_count": len(biz_rows),
             "recognition": "vlm",
         }
+        if page_extras:
+            for k in (
+                "orientation_skipped",
+                "orientation_rotate_attempts",
+                "rotate_clockwise_90_applied",
+                "vlm_orientation_gate",
+            ):
+                if k in page_extras:
+                    man_row[k] = page_extras[k]
         return json_path, man_row
 
-    with tempfile.TemporaryDirectory(prefix="delivery_vlm_") as tmp:
-        tdir = Path(tmp)
-        _prog_lock = threading.Lock()
-        _n_done = 0
+    def _encode_png_bgr(bgr: np.ndarray) -> tuple[bytes, str]:
+        ok, buf = cv2.imencode(".png", bgr)
+        if not ok:
+            raise RuntimeError("PNG 编码失败")
+        return buf.tobytes(), "image/png"
 
-        def _run_one(i: int, img_path: Path) -> tuple[int, dict[str, Any] | None, bool]:
-            if cancel_event is not None and cancel_event.is_set():
-                return (i, None, True)
-            if _wait_unpaused(pause=paused, cancel=cancel_event):
-                return (i, None, True)
-            page_id = page_id_for(img_path, root=input_root)
-            _log.info("[%s/%s] page_id=%s 文件=%s", i, n_img, page_id, img_path.name)
-            if use_pre:
-                pre_path = tdir / f"{page_id}.png"
-                preprocess_image(
-                    img_path,
-                    pre_path,
-                    max_long_edge=max_long_edge,
-                    deskew=pre_cfg.get("deskew"),
-                    tone_mode=str(pre_cfg.get("tone_mode", "raw")),
-                    rotate_degrees=float(pre_cfg.get("rotate_degrees", 0.0) or 0.0),
-                    auto_exif=bool(pre_cfg.get("auto_exif", True)),
-                    auto_rotate=bool(pre_cfg.get("auto_rotate", False)),
-                )
-                body = pre_path.read_bytes()
-                ctyp = "image/png"
-            else:
-                body = img_path.read_bytes()
-                ctyp = _content_type(img_path.suffix)
-            if cancel_event is not None and cancel_event.is_set():
-                return (i, None, True)
-            cl = OpenAICompatClient(api_key=api_key, base_url=base_url)
-            raw = call_with_retries_timeout(
-                lambda t: cl.chat_vision(
+    tdir = _prepare_run_temp_dir()
+    _log.info("本次运行临时图片目录：%s（下次运行前会清空）", tdir)
+    _prog_lock = threading.Lock()
+    _n_done = 0
+
+    def _run_one(i: int, img_path: Path) -> tuple[int, dict[str, Any] | None, bool]:
+        if cancel_event is not None and cancel_event.is_set():
+            return (i, None, True)
+        if _wait_unpaused(pause=paused, cancel=cancel_event):
+            return (i, None, True)
+        page_id = page_id_for(img_path, root=input_root)
+        _log.info("[%s/%s] page_id=%s 文件=%s", i, n_img, page_id, img_path.name)
+        pre_path: Path | None = None
+        img_work: np.ndarray | None = None
+        if use_pre:
+            pre_path = tdir / f"{page_id}.png"
+            preprocess_image(
+                img_path,
+                pre_path,
+                max_long_edge=max_long_edge,
+                deskew=pre_cfg.get("deskew"),
+                tone_mode=str(pre_cfg.get("tone_mode", "raw")),
+                auto_exif=bool(pre_cfg.get("auto_exif", True)),
+                perspective=pre_cfg.get("perspective"),
+                auto_rotate_ocr=pre_cfg.get("auto_rotate_ocr"),
+            )
+            img_work = cv2.imread(str(pre_path), cv2.IMREAD_COLOR)
+            if img_work is None:
+                raise ValueError(f"无法读取预处理图: {pre_path}")
+        else:
+            img_work = load_bgr(img_path, auto_exif=bool(pre_cfg.get("auto_exif", True)))
+        if cancel_event is not None and cancel_event.is_set():
+            return (i, None, True)
+        cl = OpenAICompatClient(api_key=api_key, base_url=base_url)
+
+        def _vision(*, system: str, user_text: str, image_bytes: bytes, ctype: str) -> str:
+            def _call_once(t: float) -> str:
+                txt = cl.chat_vision(
                     model=m_model,
-                    system=p_sys,
-                    user_text=p_user_template,
-                    image_bytes=body,
-                    content_type=ctyp,
+                    system=system,
+                    user_text=user_text,
+                    image_bytes=image_bytes,
+                    content_type=ctype,
                     temperature=temp,
                     timeout=float(t),
                     response_format_json=True,
-                ),
+                )
+                if not (txt or "").strip():
+                    raise RuntimeError("empty response body from vlm")
+                return txt
+
+            return call_with_retries_timeout(
+                _call_once,
                 tries=3,
                 base_timeout_s=float(timeout),
                 base_sleep_s=1.0,
                 on_retry=lambda att, e, s, nt: _log.warning(
-                    "VLM HTTP 失败将重试 page_id=%s attempt=%s/3 sleep=%.2fs next_timeout=%.1fs err=%s: %s",
+                    "VLM 调用失败将重试 page_id=%s attempt=%s/3 sleep=%.2fs next_timeout=%.1fs err=%s: %s",
                     page_id,
                     att + 1,
                     s,
@@ -258,56 +319,174 @@ def run_delivery_vlm_to_xlsx(
                     e,
                 ),
             )
-            biz_rows, parse_meta = parse_delivery_response(
-                raw, header_keys=header_keys, line_keys=line_keys
-            )
-            if parse_meta and parse_meta.get("parse_error"):
-                _log.warning("page_id=%s 解析异常: %s", page_id, parse_meta)
-            if not biz_rows and not (parse_meta and parse_meta.get("parse_error")):
-                _log.warning("page_id=%s VLM 返回空行，原始前 800 字：%s", page_id, (raw or "")[:800])
-            _, man_row = _export_page_json(
-                page_id=page_id,
-                source_image=img_path,
-                raw_response=raw,
-                biz_rows=biz_rows,
-                parse_meta=parse_meta,
-            )
-            return (i, man_row, False)
 
-        if max_workers <= 1:
-            for i, img_path in enumerate(images, start=1):
-                idx, row, aborted = _run_one(i, img_path)
-                if row is None and aborted:
-                    cancelled = True
+        page_extras: dict[str, Any]
+        if gate_on:
+            rotate_attempts = 0
+            total_cw90 = 0
+            current = img_work
+            raw_final = ""
+            orientation_skipped = False
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    return (i, None, True)
+                body, ctyp = _encode_png_bgr(current)
+                raw = _vision(
+                    system=p_gate_sys,
+                    user_text=p_gate_user,
+                    image_bytes=body,
+                    ctype=ctyp,
+                )
+                kind, info = parse_vlm_orientation_gate_response(raw)
+                if kind == "recognition":
+                    raw_final = raw
                     break
-                if row is not None:
-                    _stream_manifest_row(idx, row)
-                if on_page_done is not None:
-                    on_page_done(i, n_img)
-                if cancel_event is not None and cancel_event.is_set() and row is not None:
-                    cancelled = True
+                if rotate_attempts >= max_gate_rot:
+                    raw_final = raw
+                    orientation_skipped = True
                     break
+                steps = int(info.get("steps", 0))
+                current = rotate_90_bgr(current, steps)
+                total_cw90 = (total_cw90 + steps) % 4
+                rotate_attempts += 1
+            page_extras = {
+                "vlm_orientation_gate": True,
+                "orientation_rotate_attempts": rotate_attempts,
+                "orientation_skipped": orientation_skipped,
+                "rotate_clockwise_90_applied": int(total_cw90),
+            }
         else:
-            with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                pending = {ex.submit(_run_one, i, p): i for i, p in enumerate(images, start=1)}
-                try:
-                    for fut in as_completed(pending):
-                        try:
-                            _idx, row, _ab = fut.result()
-                        except Exception:
-                            ex.shutdown(wait=False, cancel_futures=True)
-                            raise
-                        if row is not None:
-                            _stream_manifest_row(_idx, row)
-                        if on_page_done is not None:
-                            with _prog_lock:
-                                _n_done += 1
-                                c = _n_done
-                            on_page_done(c, n_img)
-                except Exception:
-                    raise
-            if len(manifest_rows) < n_img and cancel_event is not None and cancel_event.is_set():
+            if use_pre and pre_path is not None:
+                body = pre_path.read_bytes()
+                ctyp = "image/png"
+            else:
+                body = img_path.read_bytes()
+                ctyp = _content_type(img_path.suffix)
+            raw_final = _vision(
+                system=p_sys,
+                user_text=p_user_template,
+                image_bytes=body,
+                ctype=ctyp,
+            )
+            page_extras = {
+                "vlm_orientation_gate": False,
+                "orientation_rotate_attempts": 0,
+                "orientation_skipped": False,
+                "rotate_clockwise_90_applied": 0,
+            }
+
+        biz_rows, parse_meta = parse_delivery_response(
+            raw_final,
+            header_keys=header_keys,
+            line_keys=line_keys,
+            drop_vlm_orientation_keys=not gate_on,
+        )
+        if gate_on and page_extras.get("orientation_skipped"):
+            skip_m = {
+                "reason": "max_orientation_gate_rotations_exceeded",
+                "max_orientation_gate_rotations": max_gate_rot,
+                "rotate_attempts": page_extras.get("orientation_rotate_attempts"),
+            }
+            if parse_meta is None:
+                parse_meta = skip_m
+            else:
+                parse_meta = {**parse_meta, **skip_m}
+        if parse_meta and parse_meta.get("parse_error"):
+            _log.warning("page_id=%s 解析异常: %s", page_id, parse_meta)
+            if parse_meta.get("parse_error") == "json":
+                raw_show = (raw_final or "")[:2000]
+                _log.warning(
+                    "page_id=%s JSON解析原始返回 len=%s repr=%r",
+                    page_id,
+                    len(raw_final or ""),
+                    raw_show,
+                )
+        if not biz_rows and not (parse_meta and parse_meta.get("parse_error")):
+            _log.warning("page_id=%s VLM 返回空行，原始前 800 字：%s", page_id, (raw_final or "")[:800])
+        _, man_row = _export_page_json(
+            page_id=page_id,
+            source_image=img_path,
+            raw_response=raw_final,
+            biz_rows=biz_rows,
+            parse_meta=parse_meta,
+            page_extras=page_extras,
+        )
+        return (i, man_row, False)
+
+    def _run_one_with_retry(
+        i: int, img_path: Path
+    ) -> tuple[int, dict[str, Any] | None, bool, dict[str, Any] | None]:
+        page_id = page_id_for(img_path, root=input_root)
+        for attempt in range(1, 4):
+            if cancel_event is not None and cancel_event.is_set():
+                return (i, None, True, None)
+            try:
+                idx, row, aborted = _run_one(i, img_path)
+                return (idx, row, aborted, None)
+            except Exception as e:  # noqa: BLE001
+                if attempt < 3:
+                    _log.warning(
+                        "page_id=%s 识别失败将重试 attempt=%s/3 err=%s: %s",
+                        page_id,
+                        attempt + 1,
+                        type(e).__name__,
+                        e,
+                    )
+                    time.sleep(0.4 * attempt)
+                    continue
+                err_txt = f"{type(e).__name__}: {e}"
+                _log.error("page_id=%s 识别失败已跳过（3次仍失败）err=%s", page_id, err_txt)
+                return (
+                    i,
+                    None,
+                    False,
+                    {
+                        "page_id": page_id,
+                        "source_image": str(img_path.resolve()),
+                        "attempts": attempt,
+                        "error": err_txt,
+                    },
+                )
+        return (i, None, False, None)
+
+    if max_workers <= 1:
+        for i, img_path in enumerate(images, start=1):
+            idx, row, aborted, fail_info = _run_one_with_retry(i, img_path)
+            if row is None and aborted:
                 cancelled = True
+                break
+            if fail_info is not None:
+                failed_pages.append(fail_info)
+            if row is not None:
+                _stream_manifest_row(idx, row)
+            if on_page_done is not None:
+                on_page_done(i, n_img)
+            if cancel_event is not None and cancel_event.is_set() and row is not None:
+                cancelled = True
+                break
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            pending = {ex.submit(_run_one_with_retry, i, p): i for i, p in enumerate(images, start=1)}
+            try:
+                for fut in as_completed(pending):
+                    try:
+                        _idx, row, _ab, fail_info = fut.result()
+                    except Exception:
+                        ex.shutdown(wait=False, cancel_futures=True)
+                        raise
+                    if fail_info is not None:
+                        failed_pages.append(fail_info)
+                    if row is not None:
+                        _stream_manifest_row(_idx, row)
+                    if on_page_done is not None:
+                        with _prog_lock:
+                            _n_done += 1
+                            c = _n_done
+                        on_page_done(c, n_img)
+            except Exception:
+                raise
+        if len(manifest_rows) < n_img and cancel_event is not None and cancel_event.is_set():
+            cancelled = True
 
     try:
         man_f.close()
@@ -315,6 +494,19 @@ def run_delivery_vlm_to_xlsx(
         pass
 
     final_man_path = write_manifest(out, subdir, manifest_name, manifest_rows)
+    tmp_png_count = len(list(tdir.glob("*.png")))
+    if n_img > 0 and len(manifest_rows) == 0 and not cancelled and not failed_pages:
+        _log.warning(
+            "未产出任何页面结果：n_total_images=%s n_pages=%s use_preprocess=%s tmp_dir=%s tmp_png_count=%s",
+            n_img,
+            len(manifest_rows),
+            use_pre,
+            str(tdir),
+            tmp_png_count,
+        )
+        cancelled = True
+    if failed_pages:
+        _log.warning("本次共跳过失败图片 %s 张", len(failed_pages))
 
     all_rows: list[dict[str, Any]] = []
     for r in manifest_rows:
@@ -333,8 +525,23 @@ def run_delivery_vlm_to_xlsx(
             if isinstance(er, dict):
                 all_rows.append(er)
 
+    merge_by_style, merge_key = delivery_xlsx_options(cfg)
+    dev = not merge_by_style
+    columns = list(xlsx_column_headers(dev=dev, header_keys=header_keys, line_keys=line_keys))
+    keys_biz = header_keys + line_keys
+    if dev:
+        rows_for_xlsx = all_rows
+    else:
+        biz_rows = [{k: r.get(k, "") for k in keys_biz} for r in all_rows]
+        rows_for_xlsx = merge_line_rows_by_style(
+            biz_rows,
+            header_keys=header_keys,
+            line_keys=line_keys,
+            merge_key=merge_key,
+        )
+
     xlsx_path = (out_xlsx or (out / "delivery_merged.xlsx")).resolve()
-    write_delivery_rows_to_xlsx(xlsx_path, all_rows, columns=columns)
+    write_delivery_rows_to_xlsx(xlsx_path, rows_for_xlsx, columns=columns)
 
     jsonl_path = None
     if out_jsonl is not None:
@@ -349,10 +556,18 @@ def run_delivery_vlm_to_xlsx(
         "out_dir": str(out),
         "n_pages": len(manifest_rows),
         "n_total_images": len(images),
-        "n_rows": len(all_rows),
+        "n_rows": len(rows_for_xlsx),
+        "n_detail_rows": len(all_rows),
+        "merge_by_style": merge_by_style,
+        "xlsx_include_trace": dev,
+        "xlsx_dev": dev,
         "manifest": str(final_man_path or man_path),
         "out_xlsx": str(xlsx_path),
         "out_jsonl": str(jsonl_path) if jsonl_path else None,
         "model": m_model,
         "cancelled": cancelled,
+        "n_failed_images": len(failed_pages),
+        "failed_pages": failed_pages,
+        "tmp_dir": str(tdir),
+        "tmp_png_count": tmp_png_count,
     }

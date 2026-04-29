@@ -5,6 +5,7 @@ import json
 import logging
 import sys
 from pathlib import Path
+from typing import Any
 
 from delivery_vlm.pipeline.delivery_run import run_delivery_vlm_to_xlsx
 
@@ -30,6 +31,20 @@ def main() -> None:
     parser.add_argument("--model", dest="mm_model", type=str, default=None, help="覆盖 VLM 模型名（否则取 yaml / VLM_MODEL）")
     parser.add_argument("--out-xlsx", dest="out_xlsx", type=Path, default=None, help="合并 xlsx 路径（默认：<out-dir>/delivery_merged.xlsx）")
     parser.add_argument("--out-jsonl", dest="out_jsonl", type=Path, default=None, help="可选：合并行 jsonl")
+    parser.add_argument(
+        "--merge-by-style",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        dest="merge_by_style",
+        help="按 merge_key 合并导出（关闭则全明细且含 page_id/source_image；覆盖 delivery.merge_by_style）",
+    )
+    parser.add_argument(
+        "--vlm-rotation",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        dest="vlm_rotation",
+        help="是否使用 VLM 判定图像朝向并旋转（默认读配置 vlm.use_vlm_rotation_gate）",
+    )
 
     args = parser.parse_args()
 
@@ -40,6 +55,13 @@ def main() -> None:
         level = logging.WARNING
     logging.basicConfig(level=level, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
+    config_overrides: dict[str, Any] = {}
+    if args.vlm_rotation is not None:
+        config_overrides["vlm"] = {"use_vlm_rotation_gate": bool(args.vlm_rotation)}
+    if args.merge_by_style is not None:
+        config_overrides.setdefault("delivery", {})["merge_by_style"] = bool(args.merge_by_style)
+    co = config_overrides if config_overrides else None
+
     summary = run_delivery_vlm_to_xlsx(
         input_dir=args.input_dir,
         out_dir=args.out_dir,
@@ -47,6 +69,7 @@ def main() -> None:
         model=args.mm_model,
         out_xlsx=args.out_xlsx,
         out_jsonl=args.out_jsonl,
+        config_overrides=co,
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     if summary.get("cancelled"):

@@ -6,3 +6,6 @@ __pycache__/
 dist/
 build/
 .env
+
+# 本地测试生成图（data/output/test 等）
+data/output/

@@ -20,7 +20,7 @@ page_text:
   subdir: pages
   manifest: pages.jsonl
 vlm:
-  model: qwen3.5-flash
+  model: qwen3.5-plus
   max_workers: 8
   max_long_edge: 1500
   use_preprocess: true

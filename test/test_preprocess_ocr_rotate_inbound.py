@@ -12,7 +12,7 @@ _IMG_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 
 
 def _output_dir() -> Path:
-    return project_root() / "data" / "output" / "test_ocr_rotate"
+    return project_root() / "data" / "output" / "test_text_orientation"
 
 
 def _list_test_images() -> list[Path]:
@@ -29,17 +29,16 @@ def _list_test_images() -> list[Path]:
 @pytest.mark.parametrize("path", _list_test_images())
 def test_inbound_images_ocr_rotate_smoke(path: Path) -> None:
     """
-    对 data/inbound/test 每张图启用 OCR 四向转正，结果写入 data/output/test_ocr_rotate。
-    未安装 PaddleOCR 时函数会回退原图，本测试仍应通过。
+    对 data/inbound/test 每张图启用文字方向检测转正（PULC），结果写入 data/output/test_text_orientation。
+    未安装 PaddleClas 时函数会回退原图，本测试仍应通过。
     """
     img = load_bgr(path, auto_exif=True)
     assert img.ndim == 3 and img.shape[2] == 3
 
     out, meta = apply_rotate_and_deskew(
         img,
-        deskew={"enabled": True, "max_abs_degrees": 20.0, "min_abs_degrees": 0.35},
         perspective={"enabled": True, "min_area_ratio": 0.06},
-        auto_rotate_ocr={"enabled": True, "langs": "ch", "max_long_edge": 1200},
+        auto_rotate_ocr={"enabled": True, "max_long_edge": 1200},
     )
     assert out.ndim == 3 and out.shape[2] == 3
     h, w = out.shape[:2]
@@ -51,7 +50,7 @@ def test_inbound_images_ocr_rotate_smoke(path: Path) -> None:
     if isinstance(ocr_meta, dict) and ocr_meta.get("skipped"):
         suffix += f"_skip-{ocr_meta.get('skipped')}"
 
-    od = _output_dir()
+    od = project_root() / "data" / "output" / "test_text_orientation"
     od.mkdir(parents=True, exist_ok=True)
     dst = od / f"{path.stem}{suffix}.png"
     assert cv2.imwrite(str(dst), out), f"写入失败: {dst}"

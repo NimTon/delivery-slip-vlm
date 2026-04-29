@@ -28,13 +28,12 @@ def _list_test_images() -> list[Path]:
 
 
 @pytest.mark.parametrize("path", _list_test_images())
-def test_inbound_images_rotate_deskew_smoke(path: Path) -> None:
+def test_inbound_images_geometry_smoke(path: Path) -> None:
     """对 data/inbound/test 下每张图跑几何前置，断言尺寸；结果写入 data/output/test。"""
     img = load_bgr(path, auto_exif=True)
     assert img.ndim == 3 and img.shape[2] == 3
     out, meta = apply_rotate_and_deskew(
         img,
-        deskew={"enabled": True, "max_abs_degrees": 20.0, "min_abs_degrees": 0.35},
         perspective={"enabled": True, "min_area_ratio": 0.06},
     )
     assert out.ndim == 3

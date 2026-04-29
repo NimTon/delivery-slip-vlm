@@ -232,58 +232,159 @@ def rectify_largest_quad_to_rectangle(
     rect_area_expand_ratio: float = 0.2,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """
-    在缩小图上找最大凸四边形，顶点映射回原图尺寸后，对**整张原图**做透视矫正，
-    再按单据在输出中的包围盒将面积扩大 ``(1 + rect_area_expand_ratio)`` 后**裁切**。
+    试验版透视矫正（按用户给定思路）：
 
-    返回 ``(图像, meta)``；meta 含 ``applied``、``out_wh``（裁切后）、``crop_*``、``dst_doc_wh`` 等。
+    1) 灰度 + Canny
+    2) findContours（仅外轮廓）
+    3) approxPolyDP 找四边形（优先面积大的）
+    4) 将四角映射到固定画布（默认 800x1100）并 warpPerspective
+
+    注：该实现不会再做“整图扩展画布 + 裁切单据”那套逻辑，而是直接输出固定尺寸的矫正图。
     """
+    _ = max_detect_long_edge, rect_area_expand_ratio  # 保留签名兼容，但此试验实现不使用
+
     meta: dict[str, Any] = {"applied": False, "reason": None}
     h0, w0 = img_bgr.shape[:2]
-    long0 = max(h0, w0)
-    scale = 1.0
-    if long0 > max_detect_long_edge > 0:
-        scale = max_detect_long_edge / float(long0)
-    w1 = max(8, int(round(w0 * scale)))
-    h1 = max(8, int(round(h0 * scale)))
-    small = cv2.resize(img_bgr, (w1, h1), interpolation=cv2.INTER_AREA)
-    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    if h0 < 10 or w0 < 10:
+        meta["reason"] = "image_too_small"
+        return img_bgr, meta
 
-    quad = _find_quad_on_gray(
-        gray,
-        min_area_ratio=min_area_ratio,
-        epsilon_ratios=epsilon_ratios,
+    def _quad_shape_score(quad_xy: np.ndarray) -> float:
+        """
+        衡量四边形“像不像矩形”：边长越均衡越好。
+        返回 (0, 1]，越接近 1 越像矩形。
+        """
+        pts = order_quad_points(quad_xy)
+        tl, tr, br, bl = pts
+        edges = [
+            float(np.linalg.norm(tl - tr)),
+            float(np.linalg.norm(tr - br)),
+            float(np.linalg.norm(br - bl)),
+            float(np.linalg.norm(bl - tl)),
+        ]
+        mn = max(min(edges), 1e-6)
+        mx = max(edges)
+        ratio = mx / mn
+        return 1.0 / ratio
+
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # Upgrade 2：双通道 Canny 融合（低阈值保召回，高阈值保干净）
+    # 阈值偏高：减少噪声边缘与误检
+    edges1 = cv2.Canny(blurred, 30, 90)
+    edges2 = cv2.Canny(blurred, 70, 160)
+    edges = cv2.bitwise_or(edges1, edges2)
+
+    # 进阶优化：形态学闭运算连接边缘（比单纯 dilate 更安全）
+    edges = cv2.morphologyEx(
+        edges,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+        iterations=1,
     )
-    if quad is None:
+    cnts, _hier = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        meta["reason"] = "no_contours"
+        return img_bgr, meta
+
+    area_img = float(h0 * w0)
+    cnts = sorted(cnts, key=cv2.contourArea, reverse=True)
+
+    # Upgrade 1：评分机制（不再 accept first quad）
+    best_score = -1.0
+    best_quad: np.ndarray | None = None
+    best_meta: dict[str, Any] = {}
+
+    def _maybe_update(quad_xy: np.ndarray, *, area: float, source: str, er: float | None = None) -> None:
+        nonlocal best_score, best_quad, best_meta
+        quad_xy = quad_xy.reshape(4, 2).astype(np.float32)
+        if not cv2.isContourConvex(quad_xy.reshape(-1, 1, 2)):
+            return
+        # 进阶优化：边界过滤（宽高比极端的直接拒绝）
+        x, y, w, h = cv2.boundingRect(quad_xy.reshape(-1, 1, 2).astype(np.int32))
+        if w <= 0 or h <= 0:
+            return
+        aspect = float(w) / float(h)
+        if aspect < 0.2 or aspect > 5.0:
+            return
+        shape_score = _quad_shape_score(quad_xy)
+        final_score = float(area) * float(shape_score)
+        if final_score > best_score:
+            best_score = final_score
+            best_quad = quad_xy
+            best_meta = {
+                "source": source,
+                "score": final_score,
+                "shape_score": shape_score,
+                "bbox_aspect": aspect,
+            }
+            if er is not None:
+                best_meta["epsilon_ratio"] = float(er)
+
+    # 先尝试所有轮廓的四边形近似
+    for cnt in cnts[:120]:
+        area = float(cv2.contourArea(cnt))
+        if area < float(min_area_ratio) * area_img:
+            continue
+        peri = cv2.arcLength(cnt, True)
+        if peri < 1e-6:
+            continue
+        for er in (epsilon_ratios or (0.02, 0.03, 0.045, 0.06)):
+            approx = cv2.approxPolyDP(cnt, float(er) * peri, True)
+            if len(approx) == 4:
+                _maybe_update(approx.reshape(4, 2), area=area, source="approx", er=float(er))
+
+    # Upgrade 3：凸包兜底机制（取最大轮廓的凸包再近似）
+    if best_quad is None and cnts:
+        largest = cnts[0]
+        area = float(cv2.contourArea(largest))
+        if area >= float(min_area_ratio) * area_img:
+            peri = cv2.arcLength(largest, True)
+            hull = cv2.convexHull(largest)
+            peri_h = cv2.arcLength(hull, True)
+            # 在 hull 上再做多 epsilon 近似
+            for er in (epsilon_ratios or (0.02, 0.03, 0.045, 0.06)):
+                approx = cv2.approxPolyDP(hull, float(er) * (peri_h if peri_h > 1e-6 else peri), True)
+                if len(approx) == 4:
+                    _maybe_update(approx.reshape(4, 2), area=area, source="hull", er=float(er))
+
+    quad_full = best_quad
+    if quad_full is None:
         meta["reason"] = "no_quad_found"
         return img_bgr, meta
 
-    sx = w0 / float(w1)
-    sy = h0 / float(h1)
-    quad_full = _scale_points_back(quad, sx, sy)
-    area_q = float(cv2.contourArea(quad_full.reshape(-1, 1, 2)))
-    meta["quad_area_ratio"] = area_q / float(w0 * h0)
+    meta["quad_area_ratio"] = float(cv2.contourArea(quad_full.reshape(-1, 1, 2))) / area_img
     meta["quad_xy"] = quad_full.tolist()
+    meta["quad_pick"] = best_meta
 
+    # 方案 A：根据四边形边长估算目标画布宽高，避免强行挤压到固定竖版画布
     dst_w, dst_h = document_rect_dimensions_from_quad(quad_full)
-    warped, wmeta = warp_full_image_by_document_homography(
-        img_bgr, quad_full, dst_width=dst_w, dst_height=dst_h, pad=2
+    src_pts = order_quad_points(quad_full)
+    dst_pts = np.array(
+        [
+            [0.0, 0.0],
+            [float(dst_w - 1), 0.0],
+            [float(dst_w - 1), float(dst_h - 1)],
+            [0.0, float(dst_h - 1)],
+        ],
+        dtype=np.float32,
     )
-    meta.update({k: v for k, v in wmeta.items() if k != "H"})
-    h_list = wmeta.get("H")
-    m2 = np.asarray(h_list, dtype=np.float64)
-    cropped, cmeta = crop_warped_to_expanded_quad_bbox(
-        warped,
-        quad_full,
-        m2,
-        area_expand_ratio=float(rect_area_expand_ratio),
+
+    m = cv2.getPerspectiveTransform(src_pts, dst_pts)
+    corrected = cv2.warpPerspective(
+        img_bgr,
+        m,
+        (dst_w, dst_h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0),
     )
-    meta["pre_crop_out_wh"] = wmeta.get("out_wh")
-    meta.update(cmeta)
-    ch, cw = cropped.shape[:2]
-    meta["out_wh"] = (cw, ch)
+    meta["dst_doc_wh"] = (dst_w, dst_h)
+    meta["out_wh"] = (dst_w, dst_h)
     meta["applied"] = True
-    meta["reason"] = "perspective_ok"
-    return cropped, meta
+    meta["reason"] = "perspective_ok_simple"
+    return corrected, meta
 
 
 def perspective_options_from_config(raw: dict[str, Any] | None) -> dict[str, Any]:

@@ -3,12 +3,10 @@ from __future__ import annotations
 from delivery_vlm.delivery_schema import (
     attach_trace,
     delivery_columns_from_config,
-    delivery_xlsx_options,
+    fill_local_subtotals,
     merge_line_rows_by_style,
     parse_delivery_response,
-    vlm_use_rotation_gate_from_config,
     xlsx_column_headers,
-    xlsx_mode_is_dev,
 )
 
 
@@ -57,27 +55,33 @@ def test_columns_from_config_default_apparel() -> None:
 
 
 def test_columns_explicit_empty_header_in_yaml() -> None:
-    cfg = {"delivery": {"header_keys": [], "line_keys": ["款号", "颜色", "S", "M", "L", "XL", "XXL", "小计"]}}
+    cfg = {"delivery": {"header_keys": [], "line_keys": ["款号", "颜色", "XS", "S", "M", "L", "XL", "XXL", "小计"]}}
     hk, lk = delivery_columns_from_config(cfg)
     assert hk == []
-    assert len(lk) == 8
+    assert len(lk) == 9
 
 
 def test_merge_by_style_sums_sizes() -> None:
     hk: list[str] = []
-    lk = ["款号", "颜色", "S", "M", "L", "XL", "XXL", "小计"]
+    lk = ["款号", "颜色", "XS", "S", "M", "L", "XL", "XXL", "小计"]
     rows = [
-        {"款号": "A", "颜色": "红", "S": "1", "M": "2", "L": "", "XL": "", "XXL": "", "小计": "3"},
-        {"款号": "A", "颜色": "黑", "S": "0", "M": "1", "L": "4", "XL": "", "XXL": "", "小计": "5"},
+        {"款号": "A", "颜色": "红", "XS": "", "S": "1", "M": "2", "L": "", "XL": "", "XXL": "", "小计": "3"},
+        {"款号": "A", "颜色": "黑", "XS": "", "S": "0", "M": "1", "L": "4", "XL": "", "XXL": "", "小计": "5"},
     ]
-    out = merge_line_rows_by_style(rows, header_keys=hk, line_keys=lk, merge_key="款号")
-    assert len(out) == 1
-    assert out[0]["款号"] == "A"
-    assert out[0]["颜色"] == "红；黑"
+    out = merge_line_rows_by_style(rows, header_keys=hk, line_keys=lk, merge_key="款号", group_keys=["款号", "颜色"])
+    # 按 款号+颜色 分组：同款不同色分开
+    assert len(out) == 2
+    out = sorted(out, key=lambda r: (r.get("款号", ""), r.get("颜色", "")))
+    assert out[0]["款号"] == "A" and out[0]["颜色"] == "红"
     assert out[0]["S"] == "1"
-    assert out[0]["M"] == "3"
-    assert out[0]["L"] == "4"
-    assert out[0]["小计"] == "8"
+    assert out[0]["M"] == "2"
+    assert out[0]["L"] == ""
+    assert out[0]["小计"] == "3"
+    assert out[1]["款号"] == "A" and out[1]["颜色"] == "黑"
+    assert out[1]["S"] == "0"
+    assert out[1]["M"] == "1"
+    assert out[1]["L"] == "4"
+    assert out[1]["小计"] == "5"
 
 
 def test_xlsx_user_columns_no_trace() -> None:
@@ -87,40 +91,21 @@ def test_xlsx_user_columns_no_trace() -> None:
     assert xlsx_column_headers(dev=True, header_keys=hk, line_keys=lk)[:2] == ("page_id", "source_image")
 
 
-def test_delivery_xlsx_options_default_user() -> None:
-    merge, mk = delivery_xlsx_options({"delivery": {}})
-    assert merge is True
-    assert mk == "款号"
+def test_drop_vlm_orientation_keys_smoke() -> None:
+    hk: list[str] = []
+    lk = ["款号", "颜色", "XS", "S", "M", "L", "XL", "XXL", "小计"]
+    raw = '{"needs_rotation": true, "rotate_clockwise_90_steps": 1, "lines":[{"款号":"A","颜色":"","XS":"","S":"","M":"","L":"","XL":"","XXL":"","小计":""}]}'
+    rows, meta = parse_delivery_response(raw, header_keys=hk, line_keys=lk, drop_vlm_orientation_keys=True)
+    assert len(rows) == 1
+    assert meta is None or "parse_error" not in (meta or {})
 
 
-def test_xlsx_mode_is_dev() -> None:
-    assert xlsx_mode_is_dev("dev") is True
-    assert xlsx_mode_is_dev("user") is False
-
-
-def test_delivery_xlsx_options_no_merge_has_trace_semantics() -> None:
-    merge, mk = delivery_xlsx_options({"delivery": {"merge_by_style": False, "merge_key": "款号"}})
-    assert merge is False
-    assert mk == "款号"
-
-
-def test_delivery_xlsx_options_legacy_xlsx_include_trace() -> None:
-    merge, _ = delivery_xlsx_options({"delivery": {"xlsx_include_trace": True}})
-    assert merge is False
-
-
-def test_delivery_xlsx_options_legacy_xlsx_mode() -> None:
-    merge, _ = delivery_xlsx_options({"delivery": {"xlsx_mode": "dev"}})
-    assert merge is False
-
-
-def test_delivery_xlsx_options_merge_wins_over_legacy_trace() -> None:
-    merge, _ = delivery_xlsx_options({"delivery": {"merge_by_style": True, "xlsx_include_trace": True}})
-    assert merge is True
-
-
-def test_vlm_use_rotation_gate_from_config() -> None:
-    assert vlm_use_rotation_gate_from_config({}) is True
-    assert vlm_use_rotation_gate_from_config({"orientation_gate": False}) is False
-    assert vlm_use_rotation_gate_from_config({"use_vlm_rotation_gate": False, "orientation_gate": True}) is False
-    assert vlm_use_rotation_gate_from_config({"use_vlm_rotation_gate": True, "orientation_gate": False}) is True
+def test_fill_local_subtotals() -> None:
+    lk = ["款号", "颜色", "XS", "S", "M", "L", "XL", "XXL", "小计"]
+    rows = [
+        {"款号": "A", "颜色": "红", "XS": "1", "S": "", "M": "2", "L": "0", "XL": "", "XXL": "", "小计": "999"},
+        {"款号": "B", "颜色": "黑", "XS": "", "S": "", "M": "", "L": "", "XL": "", "XXL": "", "小计": "5"},
+    ]
+    fill_local_subtotals(rows, line_keys=lk)
+    assert rows[0]["小计"] == "3"
+    assert rows[1]["小计"] == ""

@@ -65,7 +65,6 @@ except Exception:  # noqa: BLE001
 
 from delivery_vlm import __version__
 from delivery_vlm.config import deep_merge_config, load_config, project_root
-from delivery_vlm.delivery_schema import vlm_use_rotation_gate_from_config, xlsx_mode_is_dev
 from delivery_vlm.pipeline.delivery_run import run_delivery_vlm_to_xlsx
 
 _LOG_QUEUE: queue.Queue[str] | None = None
@@ -131,7 +130,7 @@ def main() -> None:
 
     root = tk.Tk()
     root.title(f"delivery-slip-vlm v{__version__} · 送货单识别")
-    root.geometry("1040x720")
+    root.geometry("1200x800")
     root.minsize(680, 480)
 
     if sv_ttk is not None:
@@ -198,11 +197,8 @@ def main() -> None:
 
     auto_exif_var = tk.BooleanVar(value=True)
     ocr_rot_en_var = tk.BooleanVar(value=False)
-    deskew_en_var = tk.BooleanVar(value=True)
     perspective_en_var = tk.BooleanVar(value=True)
     use_pre_var = tk.BooleanVar(value=True)
-    use_vlm_rot_var = tk.BooleanVar(value=True)
-    merge_style_var = tk.BooleanVar(value=True)
     _gui_loading = False
 
     def _sync_from_yaml() -> None:
@@ -214,23 +210,14 @@ def main() -> None:
         _gui_loading = True
         try:
             pre = dict(c.get("preprocess") or {})
-            de = dict(pre.get("deskew") or {})
             pe = dict(pre.get("perspective") or {})
             ore = dict(pre.get("auto_rotate_ocr") or {})
             vm = dict(c.get("vlm") or {})
             dl = dict(c.get("delivery") or {})
             auto_exif_var.set(bool(pre.get("auto_exif", True)))
             ocr_rot_en_var.set(bool(ore.get("enabled", False)))
-            deskew_en_var.set(bool(de.get("enabled", True)))
             perspective_en_var.set(bool(pe.get("enabled", True)))
             use_pre_var.set(bool(vm.get("use_preprocess", True)))
-            use_vlm_rot_var.set(vlm_use_rotation_gate_from_config(vm))
-            if "merge_by_style" in dl:
-                merge_style_var.set(bool(dl["merge_by_style"]))
-            elif dl.get("xlsx_include_trace") is True or xlsx_mode_is_dev(dl.get("xlsx_mode")):
-                merge_style_var.set(False)
-            else:
-                merge_style_var.set(True)
         finally:
             _gui_loading = False
 
@@ -239,15 +226,10 @@ def main() -> None:
             "preprocess": {
                 "auto_exif": auto_exif_var.get(),
                 "auto_rotate_ocr": {"enabled": ocr_rot_en_var.get()},
-                "deskew": {"enabled": deskew_en_var.get()},
                 "perspective": {"enabled": perspective_en_var.get()},
             },
             "vlm": {
                 "use_preprocess": use_pre_var.get(),
-                "use_vlm_rotation_gate": use_vlm_rot_var.get(),
-            },
-            "delivery": {
-                "merge_by_style": merge_style_var.get(),
             },
         }
 
@@ -256,10 +238,17 @@ def main() -> None:
         current = load_config(None)
         merged = deep_merge_config(current, _config_overrides())
         cfg_path.parent.mkdir(parents=True, exist_ok=True)
-        cfg_path.write_text(
-            yaml.safe_dump(merged, allow_unicode=True, sort_keys=False),
-            encoding="utf-8",
+        # 使用 block style（多行缩进），避免 {a:1,b:2} 这类单行内联格式。
+        text = yaml.safe_dump(
+            merged,
+            allow_unicode=True,
+            sort_keys=False,
+            default_flow_style=False,
+            width=120,
         )
+        if not text.endswith("\n"):
+            text += "\n"
+        cfg_path.write_text(text, encoding="utf-8")
         _log.info("GUI 已保存运行选项到 %s", cfg_path)
 
     def _persist_gui_options_from_toggle(*_: Any) -> None:
@@ -272,33 +261,27 @@ def main() -> None:
 
     fr_flags = ttk.LabelFrame(content, text="运行选项（勾选即写入 configs/default.yaml）", padding=6)
     fr_flags.pack(fill=tk.X, padx=8, pady=2)
-    for _ci in range(6):
-        fr_flags.columnconfigure(_ci, weight=1)
     chk_run_opts: list[ttk.Checkbutton] = []
     _flag_grid: tuple[tuple[str, tk.BooleanVar], ...] = (
         ("EXIF 读图转正", auto_exif_var),
-        ("OCR 四向转正", ocr_rot_en_var),
+        ("文字方向检测转正", ocr_rot_en_var),
         ("整单透视拉直", perspective_en_var),
-        ("小角倾斜纠偏", deskew_en_var),
         ("预处理再送模型", use_pre_var),
-        ("VLM 多轮转向", use_vlm_rot_var),
-        ("导出合并同款", merge_style_var),
     )
+    # 保持所有运行选项在同一行展示
+    for _ci in range(len(_flag_grid)):
+        fr_flags.columnconfigure(_ci, weight=1)
     for i, (text, var) in enumerate(_flag_grid):
-        row, col = divmod(i, 6)
         w = ttk.Checkbutton(fr_flags, text=text, variable=var)
-        w.grid(row=row, column=col, sticky=tk.W, padx=(0, 12), pady=3)
+        w.grid(row=0, column=i, sticky=tk.W, padx=(0, 12), pady=3)
         chk_run_opts.append(w)
 
     _sync_from_yaml()
     for _v in (
         auto_exif_var,
         ocr_rot_en_var,
-        deskew_en_var,
         perspective_en_var,
         use_pre_var,
-        use_vlm_rot_var,
-        merge_style_var,
     ):
         _v.trace_add("write", _persist_gui_options_from_toggle)
 
@@ -577,6 +560,10 @@ def main() -> None:
             messagebox.showerror("识别失败", err)
             if last_out[0] and last_out[0].is_dir():
                 btn_ref["state"] = tk.NORMAL
+                try:
+                    _reveal_dir(last_out[0])
+                except Exception:  # noqa: BLE001
+                    pass
             return
 
         if summary.get("cancelled"):
@@ -602,6 +589,13 @@ def main() -> None:
             if isinstance(nd, int) and isinstance(nr, int) and nd != nr:
                 msg += f"\n（由 {nd} 条明细按款号合并）"
             messagebox.showinfo("完成", msg)
+        # 任务结束后自动打开输出目录
+        if last_out[0] and last_out[0].is_dir():
+            btn_ref["state"] = tk.NORMAL
+            try:
+                _reveal_dir(last_out[0])
+            except Exception:  # noqa: BLE001
+                pass
         n_failed = int(summary.get("n_failed_images", 0) or 0)
         if n_failed > 0:
             failed = summary.get("failed_pages") or []

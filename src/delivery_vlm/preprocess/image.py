@@ -16,14 +16,13 @@ def preprocess_image(
     src: Path,
     dst: Path,
     max_long_edge: int = 2000,
-    deskew: dict[str, Any] | bool | None = None,
     tone_mode: str = "shaded",
     auto_exif: bool = True,
     perspective: dict[str, Any] | None = None,
     auto_rotate_ocr: dict[str, Any] | bool | None = None,
 ) -> Path:
     """
-    读图 → :mod:`geometry`（透视 → 可选 OCR 四向转正 → deskew）→ 可选缩放 → 可选阴影压制 → 写 PNG。
+    读图 → :mod:`geometry`（文字方向检测转正（PULC）→ 透视）→ 可选缩放 → 可选阴影压制 → 写 PNG。
 
     ``max_long_edge``:
     - 正数：长边超过该值时等比缩小；
@@ -35,7 +34,6 @@ def preprocess_image(
     img = load_bgr(src, auto_exif=auto_exif)
     img, _meta = apply_rotate_and_deskew(
         img,
-        deskew=deskew,
         perspective=perspective,
         auto_rotate_ocr=auto_rotate_ocr,
     )

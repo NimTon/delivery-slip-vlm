@@ -53,7 +53,6 @@ def test_rectify_finds_document_quad_synthetic() -> None:
     )
     assert meta.get("applied") is True
     assert meta.get("out_wh") is not None
-    assert "crop_xyxy" in meta
     cw, ch = meta["out_wh"]
     assert cw >= 80 and ch >= 80
 
@@ -77,7 +76,6 @@ def test_apply_rotate_skips_legacy_when_perspective_ok() -> None:
     cv.rectangle(img, (30, 30), (w - 30, h - 30), (0, 0, 0), 6)
     out, meta = apply_rotate_and_deskew(
         img,
-        deskew={"enabled": True},
         perspective={"enabled": True, "min_area_ratio": 0.12},
     )
     assert meta.get("perspective", {}).get("applied") is True

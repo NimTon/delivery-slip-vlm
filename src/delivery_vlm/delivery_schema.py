@@ -6,7 +6,6 @@ from delivery_vlm.llm.jsonutil import parse_json_object
 
 TRACE_KEYS = ("page_id", "source_image")
 
-_VLM_ORIENTATION_TOP_KEYS = frozenset({"needs_rotation", "rotate_clockwise_90_steps", "rotate_degrees"})
 
 # 默认：服装送货单式——无单独「表头」列，每行一款号多尺码数量 + 小计
 DEFAULT_HEADER_KEYS: tuple[str, ...] = ()
@@ -14,6 +13,7 @@ DEFAULT_HEADER_KEYS: tuple[str, ...] = ()
 DEFAULT_LINE_KEYS: tuple[str, ...] = (
     "款号",
     "颜色",
+    "XS",
     "S",
     "M",
     "L",
@@ -23,37 +23,13 @@ DEFAULT_LINE_KEYS: tuple[str, ...] = (
 )
 
 
-def delivery_xlsx_options(cfg: dict[str, Any]) -> tuple[bool, str]:
-    """
-    从配置读取 xlsx 导出策略。
-
-    返回 ``(merge_by_style, merge_key)``。
-    - ``merge_by_style`` 为真：仅业务列，按 ``merge_key`` 分组合并。
-    - 为假：输出全明细，且列中含 ``page_id`` / ``source_image``（不合并）。
-
-    未写 ``merge_by_style`` 时，若存在已弃用的 ``xlsx_include_trace`` / ``xlsx_mode``，则按其推断是否合并。
-    """
+def delivery_merge_key_from_config(cfg: dict[str, Any]) -> str:
+    """从配置读取合并键（默认：款号）。"""
     d = dict(cfg.get("delivery") or {})
-    if "merge_by_style" in d:
-        merge_by_style = bool(d["merge_by_style"])
-    else:
-        if d.get("xlsx_include_trace") is True or xlsx_mode_is_dev(d.get("xlsx_mode")):
-            merge_by_style = False
-        else:
-            merge_by_style = True
-    mk = str(d.get("merge_key") or "款号").strip() or "款号"
-    return merge_by_style, mk
+    return str(d.get("merge_key") or "款号").strip() or "款号"
 
 
-def vlm_use_rotation_gate_from_config(vlm: dict[str, Any] | None) -> bool:
-    """是否启用 VLM 朝向门控（多轮判定 + 按模型建议旋转后再识别）。"""
-    if not vlm:
-        return True
-    if "use_vlm_rotation_gate" in vlm:
-        return bool(vlm["use_vlm_rotation_gate"])
-    if "orientation_gate" in vlm:
-        return bool(vlm["orientation_gate"])
-    return True
+_VLM_ORIENTATION_TOP_KEYS = frozenset({"needs_rotation", "rotate_clockwise_90_steps", "rotate_degrees"})
 
 
 def delivery_columns_from_config(cfg: dict[str, Any]) -> tuple[list[str], list[str]]:
@@ -116,6 +92,40 @@ def _aggregate_quantity_cells(values: list[Any]) -> str:
     return str(sum(nums))
 
 
+def fill_local_subtotals(rows: list[dict[str, Any]], *, line_keys: list[str]) -> list[dict[str, Any]]:
+    """
+    本地计算并填充每行「小计」：对尺码列求和。
+
+    - 仅当 line_keys 中包含「小计」时生效
+    - 尺码列默认取 line_keys 里出现的 XS/S/M/L/XL/XXL（可按需扩展）
+    - 无法解析为数字的格按 0 处理；若该行所有尺码都为空则小计填 ""
+    """
+    if "小计" not in line_keys:
+        return rows
+    size_keys = [k for k in ("XS", "S", "M", "L", "XL", "XXL") if k in line_keys]
+    if not size_keys:
+        return rows
+
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        total = 0
+        any_val = False
+        for k in size_keys:
+            v = r.get(k, "")
+            s = _as_str(v)
+            if not s:
+                continue
+            any_val = True
+            try:
+                total += int(float(s.replace(",", "")))
+            except ValueError:
+                # 非数字按 0 处理
+                continue
+        r["小计"] = str(total) if any_val else ""
+    return rows
+
+
 def business_rows_as_strings(rows: list[dict[str, Any]], keys: list[str]) -> list[dict[str, str]]:
     """按给定键序投影为字符串单元格（用户模式、不合并时使用）。"""
     return [{k: _as_str(r.get(k, "")) for k in keys} for r in rows]
@@ -127,9 +137,14 @@ def merge_line_rows_by_style(
     header_keys: list[str],
     line_keys: list[str],
     merge_key: str = "款号",
+    group_keys: list[str] | None = None,
 ) -> list[dict[str, str]]:
     """
-    按 ``merge_key``（默认款号）分组合并多行：颜色去重串联；尺码/小计等按数值相加（无法解析则改拼接）。
+    按给定分组键合并多行（默认按 ``merge_key``）。
+
+    - 若分组键不包含「颜色」：颜色去重后用「；」串联；
+    - 若分组键包含「颜色」：同款不同色会分开输出（颜色不再串联）。
+    - 尺码/小计等按数值相加（无法解析则改拼接）。
 
     空 ``merge_key`` 的行互不合并（每行单独输出，款号格为空）。
     """
@@ -137,18 +152,29 @@ def merge_line_rows_by_style(
     if merge_key not in line_keys:
         return [{k: _as_str(r.get(k, "")) for k in keys_out} for r in rows]
 
+    gk = [merge_key] if not group_keys else [str(x).strip() for x in group_keys if str(x).strip()]
+    # 只保留在 line_keys 中存在的分组键，且去重
+    seen_gk: set[str] = set()
+    group_keys2: list[str] = []
+    for k in gk:
+        if k in line_keys and k not in seen_gk:
+            group_keys2.append(k)
+            seen_gk.add(k)
+    if not group_keys2:
+        group_keys2 = [merge_key]
+
     order: list[str] = []
     buckets: dict[str, list[dict[str, Any]]] = {}
-    display_for_bucket: dict[str, str] = {}
+    display_for_bucket: dict[str, dict[str, str]] = {}
 
     for idx, r in enumerate(rows):
-        raw_k = _as_str(r.get(merge_key))
-        if raw_k:
-            bid = raw_k
-            disp = raw_k
+        vals = {k: _as_str(r.get(k)) for k in group_keys2}
+        if any(vals.values()):
+            bid = "||".join(f"{k}={vals.get(k,'')}" for k in group_keys2)
+            disp = vals
         else:
             bid = f"__ungrouped_{idx}"
-            disp = ""
+            disp = {k: "" for k in group_keys2}
         if bid not in buckets:
             buckets[bid] = []
             order.append(bid)
@@ -167,8 +193,11 @@ def merge_line_rows_by_style(
                     v = t
                     break
             row[hk] = v
-        row[merge_key] = display_for_bucket.get(bid, "")
-        if "颜色" in line_keys:
+        disp = display_for_bucket.get(bid, {})
+        for k in group_keys2:
+            row[k] = _as_str(disp.get(k, ""))
+
+        if "颜色" in line_keys and "颜色" not in group_keys2:
             seen: set[str] = set()
             colors: list[str] = []
             for r in grp:
@@ -178,7 +207,7 @@ def merge_line_rows_by_style(
                     colors.append(c)
             row["颜色"] = "；".join(colors)
         for col in line_keys:
-            if col in (merge_key, "颜色"):
+            if col in set(group_keys2) or (col == "颜色" and "颜色" not in group_keys2):
                 continue
             row[col] = _aggregate_quantity_cells([r.get(col, "") for r in grp])
         out.append(row)
@@ -217,7 +246,11 @@ def _normalize_line(raw: Any, line_keys: list[str]) -> dict[str, str]:
         return out
     for k in line_keys:
         if k in raw:
-            out[k] = _as_str(raw.get(k))
+            v = _as_str(raw.get(k))
+            # 约束：款号统一大写（避免 a01/A01 混用导致合并不稳定）
+            if k == "款号" and v:
+                v = v.upper()
+            out[k] = v
     return out
 
 
@@ -351,47 +384,3 @@ def _strip_json_fence(raw: str) -> str:
     return s
 
 
-def extract_rotation_cw90_steps(data: dict[str, Any]) -> int:
-    """从门控 JSON 取顺时针 90° 步数 0–3（与 ``rotate_90_bgr(img, k)`` 的 k 一致）。"""
-    if "rotate_clockwise_90_steps" in data:
-        try:
-            return int(data["rotate_clockwise_90_steps"]) % 4
-        except Exception:  # noqa: BLE001
-            return 0
-    if "rotate_degrees" in data:
-        try:
-            d = float(data["rotate_degrees"])
-            k = int(round(d / 90.0)) % 4
-            return k
-        except Exception:  # noqa: BLE001
-            return 0
-    return 0
-
-
-def parse_vlm_orientation_gate_response(raw: str) -> tuple[str, dict[str, Any]]:
-    """
-    解析「朝向门控 + 识别」合一的首轮 VLM JSON。
-
-    返回 ``("rotate", {"steps": int, "raw": str})`` 或 ``("recognition", {"raw": str})``。
-    - 当 ``needs_rotation`` 为真且顺时针步数非 0 时为 rotate（仅旋转、勿输出表格）。
-    - 否则按正常识别 JSON 处理（同一次回复中的 lines/items）。
-    """
-    s = _strip_json_fence(raw)
-    try:
-        data = parse_json_object(s)
-    except Exception:  # noqa: BLE001
-        return "recognition", {"raw": raw}
-
-    if not isinstance(data, dict):
-        return "recognition", {"raw": raw}
-
-    nr = data.get("needs_rotation")
-    is_rotate = nr is True or (isinstance(nr, str) and nr.strip().lower() in ("true", "yes", "是", "1"))
-    if not is_rotate:
-        return "recognition", {"raw": raw}
-
-    steps = extract_rotation_cw90_steps(data)
-    if steps == 0:
-        return "recognition", {"raw": raw}
-
-    return "rotate", {"steps": steps, "raw": raw}

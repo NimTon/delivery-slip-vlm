@@ -60,5 +60,30 @@ class OpenAICompatClient:
                 resp = self._client.chat.completions.create(**kwargs)
         else:
             resp = self._client.chat.completions.create(**kwargs)
-        choice = resp.choices[0].message
-        return (choice.content or "").strip()
+        msg = resp.choices[0].message
+        content = (getattr(msg, "content", None) or "").strip()
+        if content:
+            return content
+
+        # 兼容部分 OpenAI-Compatible 服务：JSON mode 下 content 可能为空，
+        # 实际输出被放在 tool_calls/function_call 的 arguments 中。
+        try:
+            md = msg.model_dump()  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            md = {}
+
+        tool_calls = md.get("tool_calls") if isinstance(md, dict) else None
+        if isinstance(tool_calls, list) and tool_calls:
+            tc0 = tool_calls[0] or {}
+            fn = tc0.get("function") if isinstance(tc0, dict) else None
+            args = fn.get("arguments") if isinstance(fn, dict) else None
+            if isinstance(args, str) and args.strip():
+                return args.strip()
+
+        fc = md.get("function_call") if isinstance(md, dict) else None
+        if isinstance(fc, dict):
+            args = fc.get("arguments")
+            if isinstance(args, str) and args.strip():
+                return args.strip()
+
+        return ""

@@ -8,7 +8,9 @@ version = "0.1.0"
 description = "送货单扫描图：VLM 结构化识别并导出 xlsx（无 LLM 修正）"
 requires-python = ">=3.10"
 dependencies = [
-  "opencv-python>=4.8.0",
+  # PaddleClas 的 PULC(text_image_orientation) 在 pip 依赖上会约束 opencv-python<=4.6.0.66
+  # 本项目仅使用 OpenCV 的基础图像处理能力，4.6.0.66 足够且能避免依赖冲突。
+  "opencv-python>=4.6.0.66,<5",
   "numpy>=1.24.0",
   "pillow>=10.0.0",
   "openai>=1.40.0",
@@ -24,7 +26,8 @@ delivery-vlm-gui = "delivery_vlm.gui_app:main"
 [project.optional-dependencies]
 dev = ["pytest>=7.4.0"]
 gui = ["sv-ttk>=2.6.0"]
-ocr = ["paddleocr>=2.8.1"]
+# 方向检测（PaddleClas PULC text_image_orientation）
+pulc = ["paddleclas>=2.6.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["test"]

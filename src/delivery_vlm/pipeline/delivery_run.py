@@ -18,21 +18,17 @@ from delivery_vlm.config import deep_merge_config, load_config, project_root, vl
 from delivery_vlm.delivery_schema import (
     attach_trace,
     delivery_columns_from_config,
-    delivery_xlsx_options,
+    fill_local_subtotals,
     merge_line_rows_by_style,
     parse_delivery_response,
-    parse_vlm_orientation_gate_response,
-    vlm_use_rotation_gate_from_config,
     xlsx_column_headers,
 )
-from delivery_vlm.io.xlsx_delivery import write_delivery_rows_to_xlsx
+from delivery_vlm.io.xlsx_delivery import write_delivery_workbook_to_xlsx
 from delivery_vlm.llm.client import OpenAICompatClient
 from delivery_vlm.llm.retry import call_with_retries_timeout
-from delivery_vlm.preprocess.geometry import load_bgr, rotate_90_bgr
+from delivery_vlm.preprocess.geometry import load_bgr
 from delivery_vlm.preprocess.image import preprocess_image
 from delivery_vlm.prompts_loader import (
-    delivery_vlm_gate_system,
-    delivery_vlm_gate_user,
     delivery_vlm_system,
     delivery_vlm_user,
 )
@@ -143,8 +139,6 @@ def run_delivery_vlm_to_xlsx(
     out.mkdir(parents=True, exist_ok=True)
 
     max_long_edge = _resolve_max_long_edge(vlm=vlm, pre_cfg=pre_cfg)
-    gate_on = vlm_use_rotation_gate_from_config(vlm)
-    max_gate_rot = max(0, int(vlm.get("max_orientation_gate_rotations", 3) or 0))
 
     images = list_input_images(input_dir)
     if not images:
@@ -153,12 +147,7 @@ def run_delivery_vlm_to_xlsx(
 
     p_sys = delivery_vlm_system()
     p_user_template = delivery_vlm_user(header_keys=header_keys, line_keys=line_keys)
-    p_gate_sys = delivery_vlm_gate_system()
-    p_gate_user = delivery_vlm_gate_user(header_keys=header_keys, line_keys=line_keys)
-    if gate_on:
-        _log.info("VLM 朝向门控已开启（多轮识别；本地不做整页 90° 自动转正）")
-    else:
-        _log.info("VLM 朝向门控已关闭（单次识别；模型勿输出朝向 JSON；本地不做整页 90° 自动转正）")
+    _log.info("VLM 单次识别模式（无朝向门控）")
     api_key = str(vs.get("api_key"))
     base_url = vs.get("base_url") or None
     n_img = len(images)
@@ -236,15 +225,6 @@ def run_delivery_vlm_to_xlsx(
             "segment_count": len(biz_rows),
             "recognition": "vlm",
         }
-        if page_extras:
-            for k in (
-                "orientation_skipped",
-                "orientation_rotate_attempts",
-                "rotate_clockwise_90_applied",
-                "vlm_orientation_gate",
-            ):
-                if k in page_extras:
-                    man_row[k] = page_extras[k]
         return json_path, man_row
 
     def _encode_png_bgr(bgr: np.ndarray) -> tuple[bytes, str]:
@@ -273,7 +253,6 @@ def run_delivery_vlm_to_xlsx(
                 img_path,
                 pre_path,
                 max_long_edge=max_long_edge,
-                deskew=pre_cfg.get("deskew"),
                 tone_mode=str(pre_cfg.get("tone_mode", "raw")),
                 auto_exif=bool(pre_cfg.get("auto_exif", True)),
                 perspective=pre_cfg.get("perspective"),
@@ -298,7 +277,9 @@ def run_delivery_vlm_to_xlsx(
                     content_type=ctype,
                     temperature=temp,
                     timeout=float(t),
-                    response_format_json=True,
+                    # 兼容性：部分 OpenAI-Compatible（如 DashScope compatible-mode）对 response_format(json_object)
+                    # 支持不稳定，可能导致 message.content 为空/异常；这里改为依赖提示词约束输出 JSON。
+                    response_format_json=False,
                 )
                 if not (txt or "").strip():
                     raise RuntimeError("empty response body from vlm")
@@ -320,77 +301,28 @@ def run_delivery_vlm_to_xlsx(
                 ),
             )
 
-        page_extras: dict[str, Any]
-        if gate_on:
-            rotate_attempts = 0
-            total_cw90 = 0
-            current = img_work
-            raw_final = ""
-            orientation_skipped = False
-            while True:
-                if cancel_event is not None and cancel_event.is_set():
-                    return (i, None, True)
-                body, ctyp = _encode_png_bgr(current)
-                raw = _vision(
-                    system=p_gate_sys,
-                    user_text=p_gate_user,
-                    image_bytes=body,
-                    ctype=ctyp,
-                )
-                kind, info = parse_vlm_orientation_gate_response(raw)
-                if kind == "recognition":
-                    raw_final = raw
-                    break
-                if rotate_attempts >= max_gate_rot:
-                    raw_final = raw
-                    orientation_skipped = True
-                    break
-                steps = int(info.get("steps", 0))
-                current = rotate_90_bgr(current, steps)
-                total_cw90 = (total_cw90 + steps) % 4
-                rotate_attempts += 1
-            page_extras = {
-                "vlm_orientation_gate": True,
-                "orientation_rotate_attempts": rotate_attempts,
-                "orientation_skipped": orientation_skipped,
-                "rotate_clockwise_90_applied": int(total_cw90),
-            }
+        raw_final: str
+        if use_pre and pre_path is not None:
+            body = pre_path.read_bytes()
+            ctyp = "image/png"
         else:
-            if use_pre and pre_path is not None:
-                body = pre_path.read_bytes()
-                ctyp = "image/png"
-            else:
-                body = img_path.read_bytes()
-                ctyp = _content_type(img_path.suffix)
-            raw_final = _vision(
-                system=p_sys,
-                user_text=p_user_template,
-                image_bytes=body,
-                ctype=ctyp,
-            )
-            page_extras = {
-                "vlm_orientation_gate": False,
-                "orientation_rotate_attempts": 0,
-                "orientation_skipped": False,
-                "rotate_clockwise_90_applied": 0,
-            }
+            body = img_path.read_bytes()
+            ctyp = _content_type(img_path.suffix)
+        raw_final = _vision(
+            system=p_sys,
+            user_text=p_user_template,
+            image_bytes=body,
+            ctype=ctyp,
+        )
 
         biz_rows, parse_meta = parse_delivery_response(
             raw_final,
             header_keys=header_keys,
             line_keys=line_keys,
-            drop_vlm_orientation_keys=not gate_on,
+            drop_vlm_orientation_keys=True,
         )
-        if gate_on and page_extras.get("orientation_skipped"):
-            skip_m = {
-                "reason": "max_orientation_gate_rotations_exceeded",
-                "max_orientation_gate_rotations": max_gate_rot,
-                "rotate_attempts": page_extras.get("orientation_rotate_attempts"),
-            }
-            if parse_meta is None:
-                parse_meta = skip_m
-            else:
-                parse_meta = {**parse_meta, **skip_m}
+        # 小计本地计算：不依赖 VLM 识别
+        fill_local_subtotals(biz_rows, line_keys=line_keys)
         if parse_meta and parse_meta.get("parse_error"):
             _log.warning("page_id=%s 解析异常: %s", page_id, parse_meta)
             if parse_meta.get("parse_error") == "json":
@@ -409,7 +341,7 @@ def run_delivery_vlm_to_xlsx(
             raw_response=raw_final,
             biz_rows=biz_rows,
             parse_meta=parse_meta,
-            page_extras=page_extras,
+            page_extras=None,
         )
         return (i, man_row, False)
 
@@ -525,23 +457,33 @@ def run_delivery_vlm_to_xlsx(
             if isinstance(er, dict):
                 all_rows.append(er)
 
-    merge_by_style, merge_key = delivery_xlsx_options(cfg)
-    dev = not merge_by_style
-    columns = list(xlsx_column_headers(dev=dev, header_keys=header_keys, line_keys=line_keys))
+    # 固定输出两个 sheet：
+    # 1) detail：全明细 + 追溯列
+    # 2) merged：按 merge_key 合并后的业务列
+    dcfg = dict(cfg.get("delivery") or {})
+    merge_key = str(dcfg.get("merge_key") or "款号").strip() or "款号"
+
+    columns_detail = list(xlsx_column_headers(dev=True, header_keys=header_keys, line_keys=line_keys))
+    columns_merged = list(xlsx_column_headers(dev=False, header_keys=header_keys, line_keys=line_keys))
     keys_biz = header_keys + line_keys
-    if dev:
-        rows_for_xlsx = all_rows
-    else:
-        biz_rows = [{k: r.get(k, "") for k in keys_biz} for r in all_rows]
-        rows_for_xlsx = merge_line_rows_by_style(
-            biz_rows,
-            header_keys=header_keys,
-            line_keys=line_keys,
-            merge_key=merge_key,
-        )
+    rows_detail = all_rows
+    biz_rows = [{k: r.get(k, "") for k in keys_biz} for r in all_rows]
+    rows_merged = merge_line_rows_by_style(
+        biz_rows,
+        header_keys=header_keys,
+        line_keys=line_keys,
+        merge_key=merge_key,
+        group_keys=[merge_key, "颜色"] if "颜色" in line_keys and merge_key != "颜色" else [merge_key],
+    )
 
     xlsx_path = (out_xlsx or (out / "delivery_merged.xlsx")).resolve()
-    write_delivery_rows_to_xlsx(xlsx_path, rows_for_xlsx, columns=columns)
+    write_delivery_workbook_to_xlsx(
+        xlsx_path,
+        sheets=[
+            ("detail", rows_detail, columns_detail),
+            ("merged", rows_merged, columns_merged),
+        ],
+    )
 
     jsonl_path = None
     if out_jsonl is not None:
@@ -556,11 +498,9 @@ def run_delivery_vlm_to_xlsx(
         "out_dir": str(out),
         "n_pages": len(manifest_rows),
         "n_total_images": len(images),
-        "n_rows": len(rows_for_xlsx),
+        "n_rows": len(rows_merged),
         "n_detail_rows": len(all_rows),
-        "merge_by_style": merge_by_style,
-        "xlsx_include_trace": dev,
-        "xlsx_dev": dev,
+        "xlsx_sheets": ["detail", "merged"],
         "manifest": str(final_man_path or man_path),
         "out_xlsx": str(xlsx_path),
         "out_jsonl": str(jsonl_path) if jsonl_path else None,

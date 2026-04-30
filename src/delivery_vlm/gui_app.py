@@ -65,6 +65,7 @@ except Exception:  # noqa: BLE001
 
 from delivery_vlm import __version__
 from delivery_vlm.config import deep_merge_config, load_config, project_root
+from delivery_vlm.gui_license import evaluate_gui_license
 from delivery_vlm.pipeline.delivery_run import run_delivery_vlm_to_xlsx
 
 _LOG_QUEUE: queue.Queue[str] | None = None
@@ -132,6 +133,17 @@ def main() -> None:
     root.title(f"delivery-slip-vlm v{__version__} · 送货单识别")
     root.geometry("1200x800")
     root.minsize(680, 480)
+
+    lic = evaluate_gui_license(timeout=8.0)
+    if not lic.allowed:
+        _lic_title = "授权校验失败" if lic.reference_date is None else "授权已到期"
+        messagebox.showerror(_lic_title, lic.message)
+        root.destroy()
+        raise SystemExit(2)
+    if lic.check_skipped or lic.used_remote_date:
+        _log.info("授权校验: %s", lic.message)
+    else:
+        _log.warning("授权校验: %s", lic.message)
 
     if sv_ttk is not None:
         try:
@@ -469,6 +481,15 @@ def main() -> None:
 
     def on_start() -> None:
         if is_running[0]:
+            return
+        lic_run = evaluate_gui_license(timeout=8.0)
+        if not lic_run.allowed:
+            _t = "授权校验失败" if lic_run.reference_date is None else "授权已到期"
+            messagebox.showerror(_t, lic_run.message)
+            st_lbl.config(
+                text="无法联网完成授权校验" if lic_run.reference_date is None else "授权已到期",
+                foreground="red",
+            )
             return
         try:
             _save_gui_options_to_yaml()

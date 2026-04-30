@@ -26,6 +26,7 @@ delivery-vlm-gui = "delivery_vlm.gui_app:main"
 [project.optional-dependencies]
 dev = ["pytest>=7.4.0"]
 gui = ["sv-ttk>=2.6.0"]
+sp1 = ["pyinstaller>=6.0"]
 # 方向检测（PaddleClas PULC text_image_orientation）
 pulc = ["paddleclas>=2.6.0"]
 
@@ -35,6 +36,3 @@ pythonpath = ["src"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.setuptools.package-dir]
-"" = "src"

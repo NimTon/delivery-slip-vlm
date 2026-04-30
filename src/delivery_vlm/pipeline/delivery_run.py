@@ -16,6 +16,7 @@ import numpy as np
 
 from delivery_vlm.config import deep_merge_config, load_config, project_root, vlm_settings
 from delivery_vlm.delivery_schema import (
+    XLSX_ORIGINAL_IMAGE_PATH_COLUMN,
     attach_trace,
     delivery_columns_from_config,
     fill_local_subtotals,
@@ -455,17 +456,19 @@ def run_delivery_vlm_to_xlsx(
             continue
         for er in data.get("excel_rows") or []:
             if isinstance(er, dict):
+                if XLSX_ORIGINAL_IMAGE_PATH_COLUMN not in er:
+                    legacy = str(er.get("原图", "")).strip()
+                    if legacy:
+                        er[XLSX_ORIGINAL_IMAGE_PATH_COLUMN] = legacy
                 all_rows.append(er)
 
-    # 固定输出两个 sheet：
-    # 1) detail：全明细 + 追溯列
-    # 2) merged：按 merge_key 合并后的业务列
+    # 固定输出两个 sheet：「明细」嵌原图缩略图；「合并」仅文本（含原图路径），不嵌图
     dcfg = dict(cfg.get("delivery") or {})
     merge_key = str(dcfg.get("merge_key") or "款号").strip() or "款号"
 
     columns_detail = list(xlsx_column_headers(dev=True, header_keys=header_keys, line_keys=line_keys))
     columns_merged = list(xlsx_column_headers(dev=False, header_keys=header_keys, line_keys=line_keys))
-    keys_biz = header_keys + line_keys
+    keys_biz = [XLSX_ORIGINAL_IMAGE_PATH_COLUMN] + header_keys + line_keys
     rows_detail = all_rows
     biz_rows = [{k: r.get(k, "") for k in keys_biz} for r in all_rows]
     rows_merged = merge_line_rows_by_style(
@@ -480,8 +483,8 @@ def run_delivery_vlm_to_xlsx(
     write_delivery_workbook_to_xlsx(
         xlsx_path,
         sheets=[
-            ("detail", rows_detail, columns_detail),
-            ("merged", rows_merged, columns_merged),
+            ("明细", rows_detail, columns_detail, True),
+            ("合并", rows_merged, columns_merged, False),
         ],
     )
 
@@ -500,7 +503,7 @@ def run_delivery_vlm_to_xlsx(
         "n_total_images": len(images),
         "n_rows": len(rows_merged),
         "n_detail_rows": len(all_rows),
-        "xlsx_sheets": ["detail", "merged"],
+        "xlsx_sheets": ["明细", "合并"],
         "manifest": str(final_man_path or man_path),
         "out_xlsx": str(xlsx_path),
         "out_jsonl": str(jsonl_path) if jsonl_path else None,

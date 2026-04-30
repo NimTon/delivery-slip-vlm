@@ -4,7 +4,12 @@ from typing import Any
 
 from delivery_vlm.llm.jsonutil import parse_json_object
 
-TRACE_KEYS = ("page_id", "source_image")
+# xlsx / excel_rows：原始输入图片绝对路径（文本）
+XLSX_ORIGINAL_IMAGE_PATH_COLUMN = "原图路径"
+# 明细 sheet 中用于插入缩略图的列名（单元格内嵌图，不写路径文本）
+XLSX_ORIGINAL_IMAGE_EMBED_COLUMN = "原图"
+
+TRACE_KEYS = ("page_id", XLSX_ORIGINAL_IMAGE_PATH_COLUMN)
 
 
 # 默认：服装送货单式——无单独「表头」列，每行一款号多尺码数量 + 小计
@@ -57,8 +62,8 @@ def delivery_columns_from_config(cfg: dict[str, Any]) -> tuple[list[str], list[s
 
 
 def xlsx_column_order(header_keys: list[str], line_keys: list[str]) -> tuple[str, ...]:
-    """含 ``page_id`` / ``source_image`` 的列序（开发/排错用）。"""
-    return tuple(TRACE_KEYS + tuple(header_keys) + tuple(line_keys))
+    """明细 sheet：``page_id``、``原图路径``、嵌入列 ``原图``、再业务列。"""
+    return tuple(TRACE_KEYS + (XLSX_ORIGINAL_IMAGE_EMBED_COLUMN,) + tuple(header_keys) + tuple(line_keys))
 
 
 def xlsx_mode_is_dev(mode: str | None) -> bool:
@@ -75,7 +80,7 @@ def xlsx_column_headers(
     """写入 xlsx 的表头列序：``dev`` 时含追溯列，否则仅业务列。"""
     if dev:
         return xlsx_column_order(header_keys, line_keys)
-    return tuple(header_keys) + tuple(line_keys)
+    return (XLSX_ORIGINAL_IMAGE_PATH_COLUMN,) + tuple(header_keys) + tuple(line_keys)
 
 
 def _aggregate_quantity_cells(values: list[Any]) -> str:
@@ -148,7 +153,7 @@ def merge_line_rows_by_style(
 
     空 ``merge_key`` 的行互不合并（每行单独输出，款号格为空）。
     """
-    keys_out = list(header_keys) + list(line_keys)
+    keys_out = [XLSX_ORIGINAL_IMAGE_PATH_COLUMN] + list(header_keys) + list(line_keys)
     if merge_key not in line_keys:
         return [{k: _as_str(r.get(k, "")) for k in keys_out} for r in rows]
 
@@ -193,6 +198,14 @@ def merge_line_rows_by_style(
                     v = t
                     break
             row[hk] = v
+        seen_paths: set[str] = set()
+        paths: list[str] = []
+        for r in grp:
+            t = _as_str(r.get(XLSX_ORIGINAL_IMAGE_PATH_COLUMN))
+            if t and t not in seen_paths:
+                seen_paths.add(t)
+                paths.append(t)
+        row[XLSX_ORIGINAL_IMAGE_PATH_COLUMN] = "；".join(paths)
         disp = display_for_bucket.get(bid, {})
         for k in group_keys2:
             row[k] = _as_str(disp.get(k, ""))
@@ -265,7 +278,7 @@ def merge_to_excel_rows(
 ) -> list[dict[str, str]]:
     """表头 + 多行明细展开为多行 xlsx 记录（每行含追溯列）。"""
     h = {k: header.get(k, "") for k in header_keys}
-    trace = {"page_id": page_id, "source_image": source_image}
+    trace = {"page_id": page_id, XLSX_ORIGINAL_IMAGE_PATH_COLUMN: source_image}
     if not lines:
         row: dict[str, str] = {**trace, **h, **_blank_line(line_keys)}
         return [row]
@@ -284,7 +297,7 @@ def parse_delivery_response(
 ) -> tuple[list[dict[str, str]], dict[str, Any] | None]:
     """
     解析 VLM 返回的 JSON。
-    返回值为「仅业务列」的行列表（不含 page_id/source_image），由调用方 attach_trace。
+    返回值为「仅业务列」的行列表（不含 page_id/原图路径），由调用方 attach_trace。
 
     支持：
     - {\"header\": {...}, \"lines\": [{...}, ...]} 或 \"明细\" 代替 lines
@@ -354,7 +367,7 @@ def parse_delivery_response(
         header_keys=header_keys,
         line_keys=line_keys,
         page_id="__p__",
-        source_image="__s__",
+        source_image="__原图路径__",
     )
     biz_only: list[dict[str, str]] = []
     for r in full:
@@ -368,7 +381,7 @@ def attach_trace(rows: list[dict[str, str]], *, page_id: str, source_image: str,
     for r in rows:
         h = {k: r.get(k, "") for k in header_keys}
         ln = {k: r.get(k, "") for k in line_keys}
-        out.append({"page_id": page_id, "source_image": source_image, **h, **ln})
+        out.append({"page_id": page_id, XLSX_ORIGINAL_IMAGE_PATH_COLUMN: source_image, **h, **ln})
     return out
 
 

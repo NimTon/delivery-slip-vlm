@@ -6,14 +6,14 @@ from delivery_vlm.io.xlsx_delivery import write_delivery_rows_to_xlsx
 
 
 def test_write_delivery_xlsx(tmp_path: Path) -> None:
-    cols = ("page_id", "source_image", "款号", "颜色", "S", "M", "L", "XL", "XXL", "小计")
+    cols = ("page_id", "原图路径", "原图", "款号", "颜色", "S", "M", "L", "XL", "XXL", "小计")
     p = tmp_path / "d.xlsx"
     write_delivery_rows_to_xlsx(
         p,
         [
             {
                 "page_id": "a",
-                "source_image": "x.png",
+                "原图路径": "x.png",
                 "款号": "X1",
                 "颜色": "红",
                 "S": "0",

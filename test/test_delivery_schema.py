@@ -25,6 +25,7 @@ def test_parse_header_lines_apparel() -> None:
     assert rows[0]["小计"] == "3"
     full = attach_trace(rows, page_id="p1", source_image="/x/a.png", header_keys=hk, line_keys=lk)
     assert full[0]["page_id"] == "p1"
+    assert full[0]["原图路径"] == "/x/a.png"
     assert full[0]["M"] == "2"
 
 
@@ -87,8 +88,8 @@ def test_merge_by_style_sums_sizes() -> None:
 def test_xlsx_user_columns_no_trace() -> None:
     hk: list[str] = []
     lk = ["款号", "颜色", "S"]
-    assert xlsx_column_headers(dev=False, header_keys=hk, line_keys=lk) == ("款号", "颜色", "S")
-    assert xlsx_column_headers(dev=True, header_keys=hk, line_keys=lk)[:2] == ("page_id", "source_image")
+    assert xlsx_column_headers(dev=False, header_keys=hk, line_keys=lk) == ("原图路径", "款号", "颜色", "S")
+    assert xlsx_column_headers(dev=True, header_keys=hk, line_keys=lk)[:4] == ("page_id", "原图路径", "原图", "款号")
 
 
 def test_drop_vlm_orientation_keys_smoke() -> None:

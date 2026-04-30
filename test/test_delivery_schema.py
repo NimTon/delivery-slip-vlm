@@ -89,7 +89,7 @@ def test_xlsx_user_columns_no_trace() -> None:
     hk: list[str] = []
     lk = ["款号", "颜色", "S"]
     assert xlsx_column_headers(dev=False, header_keys=hk, line_keys=lk) == ("原图路径", "款号", "颜色", "S")
-    assert xlsx_column_headers(dev=True, header_keys=hk, line_keys=lk)[:4] == ("page_id", "原图路径", "原图", "款号")
+    assert xlsx_column_headers(dev=True, header_keys=hk, line_keys=lk)[:3] == ("page_id", "原图路径", "款号")
 
 
 def test_drop_vlm_orientation_keys_smoke() -> None:

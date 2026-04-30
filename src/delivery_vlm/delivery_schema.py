@@ -6,8 +6,6 @@ from delivery_vlm.llm.jsonutil import parse_json_object
 
 # xlsx / excel_rows：原始输入图片绝对路径（文本）
 XLSX_ORIGINAL_IMAGE_PATH_COLUMN = "原图路径"
-# 明细 sheet 中用于插入缩略图的列名（单元格内嵌图，不写路径文本）
-XLSX_ORIGINAL_IMAGE_EMBED_COLUMN = "原图"
 
 TRACE_KEYS = ("page_id", XLSX_ORIGINAL_IMAGE_PATH_COLUMN)
 
@@ -62,8 +60,8 @@ def delivery_columns_from_config(cfg: dict[str, Any]) -> tuple[list[str], list[s
 
 
 def xlsx_column_order(header_keys: list[str], line_keys: list[str]) -> tuple[str, ...]:
-    """明细 sheet：``page_id``、``原图路径``、嵌入列 ``原图``、再业务列。"""
-    return tuple(TRACE_KEYS + (XLSX_ORIGINAL_IMAGE_EMBED_COLUMN,) + tuple(header_keys) + tuple(line_keys))
+    """明细 sheet：``page_id``、``原图路径``、再业务列。"""
+    return tuple(TRACE_KEYS + tuple(header_keys) + tuple(line_keys))
 
 
 def xlsx_mode_is_dev(mode: str | None) -> bool:

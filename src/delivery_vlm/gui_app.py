@@ -180,6 +180,8 @@ def main() -> None:
     work_dir: list[Path | None] = [None]
     is_temp: list[bool] = [False]
     last_out: list[Path | None] = [None]
+    pick_mode: list[str] = ["none"]  # none | dir | files_unique | files_multi
+    picked_files: list[list[Path] | None] = [None]  # 仅 files_unique 使用（原始路径，保持顺序）
 
     run_cancel = threading.Event()
     is_running: list[bool] = [False]
@@ -407,6 +409,8 @@ def main() -> None:
         imgs = _list_images(d)
         work_dir[0] = d
         is_temp[0] = False
+        pick_mode[0] = "dir"
+        picked_files[0] = None
         lbl_in.config(text=f"文件夹: {d}  （共 {len(imgs)} 张图）", foreground="black")
         if not imgs:
             lbl_hint.config(text="该路径下无支持的图片。", foreground="#a60")
@@ -424,21 +428,35 @@ def main() -> None:
         paths = [Path(f) for f in files if Path(f).is_file()]
         if not paths:
             return
-        tmp = Path(tempfile.mkdtemp(prefix="delivery_vlm_gui_"))
-        for src in paths:
-            shutil.copy2(src, tmp / src.name)
-        work_dir[0] = tmp
-        is_temp[0] = True
-        imgs = _list_images(tmp)
-        lbl_in.config(
-            text=f"已选 {len(paths)} 个文件（临时目录 {tmp}，共 {len(imgs)} 张有效图）",
-            foreground="black",
-        )
-        if not imgs:
-            lbl_hint.config(text="复制后无有效图片。", foreground="#a60")
-            messagebox.showwarning("提示", "未复制到有效图片。")
+        parents = {p.resolve().parent for p in paths}
+        if len(parents) == 1:
+            # 来源路径唯一：按“文件夹模式”处理，但只处理被选中的这些文件；且会重命名原图
+            d = next(iter(parents))
+            work_dir[0] = d
+            is_temp[0] = False
+            pick_mode[0] = "files_unique"
+            picked_files[0] = [p.resolve() for p in paths]
+            lbl_in.config(text=f"已选 {len(paths)} 张（同目录: {d}）", foreground="black")
+            lbl_hint.config(text="将按输入顺序重命名原图，并把 xlsx 输出到该目录。", foreground="#444")
         else:
-            lbl_hint.config(text=f"已选 {len(imgs)} 张，任务结束后将删除临时目录。", foreground="#444")
+            # 来源路径不唯一：走默认处理（复制到临时目录/输出到 out），不改原图名
+            tmp = Path(tempfile.mkdtemp(prefix="delivery_vlm_gui_"))
+            for src in paths:
+                shutil.copy2(src, tmp / src.name)
+            work_dir[0] = tmp
+            is_temp[0] = True
+            pick_mode[0] = "files_multi"
+            picked_files[0] = None
+            imgs = _list_images(tmp)
+            lbl_in.config(
+                text=f"已选 {len(paths)} 个文件（来源目录不唯一；临时目录 {tmp}，共 {len(imgs)} 张有效图）",
+                foreground="black",
+            )
+            if not imgs:
+                lbl_hint.config(text="复制后无有效图片。", foreground="#a60")
+                messagebox.showwarning("提示", "未复制到有效图片。")
+            else:
+                lbl_hint.config(text=f"已选 {len(imgs)} 张，任务结束后将删除临时目录。", foreground="#444")
 
     btn_dir["command"] = on_pick_dir
     btn_files["command"] = on_pick_files
@@ -500,7 +518,11 @@ def main() -> None:
         if not wd or not wd.is_dir():
             messagebox.showwarning("提示", "请先选择图片文件夹或多选图片。")
             return
-        n = len(_list_images(wd))
+        mode = pick_mode[0]
+        if mode == "files_unique" and picked_files[0]:
+            n = len(picked_files[0])
+        else:
+            n = len(_list_images(wd))
         if n < 1:
             messagebox.showwarning("提示", "当前输入下没有可处理的图片。")
             return
@@ -510,8 +532,22 @@ def main() -> None:
         src_name = _safe_name(wd.name) if wd.name else "input"
         out = (project_root() / "data" / "out" / f"delivery_gui_{ts}_{src_name}").resolve()
         out.mkdir(parents=True, exist_ok=True)
-        last_out[0] = out
-        lbl_path.config(text=f"本次输出: {out}", foreground="black")
+        # xlsx 输出位置：文件夹模式 / 多选且同目录 => 输出到该目录；否则按默认输出到 out
+        out_xlsx: Path | None
+        rename_inputs: bool
+        input_files: list[Path] | None
+        if mode in ("dir", "files_unique"):
+            out_xlsx = (wd / f"delivery_merged_{ts}.xlsx").resolve()
+            last_out[0] = wd
+            rename_inputs = True
+            input_files = picked_files[0] if mode == "files_unique" else None
+            lbl_path.config(text=f"本次输出: xlsx={out_xlsx}", foreground="black")
+        else:
+            out_xlsx = None
+            last_out[0] = out
+            rename_inputs = False
+            input_files = None
+            lbl_path.config(text=f"本次输出: {out}", foreground="black")
 
         is_running[0] = True
         _set_inputs(tk.DISABLED)
@@ -540,17 +576,20 @@ def main() -> None:
             try:
                 summary = run_delivery_vlm_to_xlsx(
                     input_dir=wd,
+                    input_files=input_files,
                     out_dir=out,
                     config_path=None,
                     model=None,
+                    out_xlsx=out_xlsx,
                     cancel_event=run_cancel,
                     on_page_done=on_page_done,
                     config_overrides=_config_overrides(),
+                    rename_inputs=rename_inputs,
                 )
             except Exception as e:  # noqa: BLE001
                 err = str(e)
             try:
-                if was_temp and wd and wd.is_dir():
+                if was_temp and wd and wd.is_dir() and mode == "files_multi":
                     shutil.rmtree(wd, ignore_errors=True)
                     is_temp[0] = False
                     work_dir[0] = None

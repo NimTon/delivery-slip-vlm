@@ -1,4 +1,4 @@
-﻿# SP1: build GUI to one-file exe (PyInstaller). Run from repo root:
+# SP1: build GUI to one-file exe (PyInstaller). Run from repo root:
 #   .\scripts\sp1\build_gui_sp1.ps1
 # Optional: -Python <path\to\python.exe>
 

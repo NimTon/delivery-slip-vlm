@@ -8,8 +8,9 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import cv2
 import numpy as np
@@ -33,7 +34,7 @@ from delivery_vlm.prompts_loader import (
     delivery_vlm_system,
     delivery_vlm_user,
 )
-from delivery_vlm.pipeline.scan_pages import list_input_images, page_id_for
+from delivery_vlm.pipeline.scan_pages import list_input_images, page_id_for, rename_images_sequentially
 
 _log = logging.getLogger(__name__)
 
@@ -100,11 +101,13 @@ def write_manifest(out: Path, subdir: str, manifest_name: str, rows: list[dict[s
 def run_delivery_vlm_to_xlsx(
     *,
     input_dir: Path,
+    input_files: Sequence[Path] | None = None,
     out_dir: Path | None = None,
     config_path: Path | None = None,
     model: str | None = None,
     out_xlsx: Path | None = None,
     out_jsonl: Path | None = None,
+    rename_inputs: bool = True,
     cancel_event: threading.Event | None = None,
     paused: Callable[[], bool] | None = None,
     on_page_done: Callable[[int, int], None] | None = None,
@@ -141,10 +144,20 @@ def run_delivery_vlm_to_xlsx(
 
     max_long_edge = _resolve_max_long_edge(vlm=vlm, pre_cfg=pre_cfg)
 
-    images = list_input_images(input_dir)
+    if input_files is None:
+        images = list_input_images(input_dir)
+    else:
+        images = [Path(p) for p in input_files]
     if not images:
         raise FileNotFoundError(f"目录中未找到图片: {input_dir}")
     input_root = input_dir.resolve()
+
+    # 需求：按输入顺序就地重命名（000.jpg/001.jpg...）；可由调用方关闭
+    if rename_inputs:
+        try:
+            images = rename_images_sequentially(images, digits=3)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"输入图片重命名失败（请检查文件占用/权限）：{e}") from e
 
     p_sys = delivery_vlm_system()
     p_user_template = delivery_vlm_user(header_keys=header_keys, line_keys=line_keys)
@@ -479,12 +492,22 @@ def run_delivery_vlm_to_xlsx(
         group_keys=[merge_key, "颜色"] if "颜色" in line_keys and merge_key != "颜色" else [merge_key],
     )
 
-    xlsx_path = (out_xlsx or (out / "delivery_merged.xlsx")).resolve()
+    # 默认 xlsx 输出位置：
+    # - 若用户显式传入 out_xlsx：按其路径
+    # - 若未传 out_dir（CLI 常见）：输出到输入图片目录下
+    # - 若传了 out_dir（GUI 常见）：输出到 out_dir 下
+    ts_xlsx = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if out_xlsx is not None:
+        xlsx_path = out_xlsx.resolve()
+    elif out_dir is None:
+        xlsx_path = (input_root / f"delivery_merged_{ts_xlsx}.xlsx").resolve()
+    else:
+        xlsx_path = (out / f"delivery_merged_{ts_xlsx}.xlsx").resolve()
     write_delivery_workbook_to_xlsx(
         xlsx_path,
         sheets=[
-            ("明细", rows_detail, columns_detail, True),
-            ("合并", rows_merged, columns_merged, False),
+            ("明细", rows_detail, columns_detail),
+            ("合并", rows_merged, columns_merged),
         ],
     )
 

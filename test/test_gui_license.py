@@ -11,11 +11,12 @@ def test_http_date_to_utc_date() -> None:
 
 
 def test_evaluate_allowed_with_remote() -> None:
-    with patch(
-        "delivery_vlm.gui_license.fetch_reference_date",
-        return_value=(date(2026, 4, 30), True),
-    ):
-        st = evaluate_gui_license(valid_until=date(2027, 12, 31), timeout=1.0)
+    with patch("delivery_vlm.gui_license.LICENSE_CHECK_ENABLED", True):
+        with patch(
+            "delivery_vlm.gui_license.fetch_reference_date",
+            return_value=(date(2026, 4, 30), True),
+        ):
+            st = evaluate_gui_license(valid_until=date(2027, 12, 31), timeout=1.0)
     assert isinstance(st, GuiLicenseStatus)
     assert st.allowed
     assert st.reference_date == date(2026, 4, 30)
@@ -24,19 +25,21 @@ def test_evaluate_allowed_with_remote() -> None:
 
 
 def test_evaluate_expired_with_remote() -> None:
-    with patch(
-        "delivery_vlm.gui_license.fetch_reference_date",
-        return_value=(date(2028, 1, 1), True),
-    ):
-        st = evaluate_gui_license(valid_until=date(2027, 12, 31), timeout=1.0)
+    with patch("delivery_vlm.gui_license.LICENSE_CHECK_ENABLED", True):
+        with patch(
+            "delivery_vlm.gui_license.fetch_reference_date",
+            return_value=(date(2028, 1, 1), True),
+        ):
+            st = evaluate_gui_license(valid_until=date(2027, 12, 31), timeout=1.0)
     assert not st.allowed
     assert "到期" in st.message
     assert st.check_skipped is False
 
 
 def test_network_required_fails_when_no_remote_date() -> None:
-    with patch("delivery_vlm.gui_license.fetch_reference_date", return_value=(None, False)):
-        st = evaluate_gui_license(valid_until=date(2027, 12, 31), timeout=1.0)
+    with patch("delivery_vlm.gui_license.LICENSE_CHECK_ENABLED", True):
+        with patch("delivery_vlm.gui_license.fetch_reference_date", return_value=(None, False)):
+            st = evaluate_gui_license(valid_until=date(2027, 12, 31), timeout=1.0)
     assert not st.allowed
     assert st.reference_date is None
     assert "网络" in st.message or "在线" in st.message

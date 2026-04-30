@@ -29,7 +29,13 @@ def main() -> None:
     )
     parser.add_argument("--config", dest="config", type=Path, default=None, help="覆盖默认 configs/default.yaml")
     parser.add_argument("--model", dest="mm_model", type=str, default=None, help="覆盖 VLM 模型名（否则取 yaml / VLM_MODEL）")
-    parser.add_argument("--out-xlsx", dest="out_xlsx", type=Path, default=None, help="合并 xlsx 路径（默认：<out-dir>/delivery_merged.xlsx）")
+    parser.add_argument(
+        "--out-xlsx",
+        dest="out_xlsx",
+        type=Path,
+        default=None,
+        help="合并 xlsx 路径（默认：若未指定 --out-dir 则输出到输入目录；否则为 <out-dir>/delivery_merged.xlsx）",
+    )
     parser.add_argument("--out-jsonl", dest="out_jsonl", type=Path, default=None, help="可选：合并行 jsonl")
     args = parser.parse_args()
 
